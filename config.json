@@ -107,5 +107,18 @@
       }
     ],
     "legacy_model": "wakeword.onnx"
+  },
+  "recording": {
+    "start_timeout_seconds": 6.0,
+    "end_silence_seconds": 1.0,
+    "max_record_seconds": 20.0,
+    "min_speech_seconds": 0.25,
+    "noise_calibration_seconds": 0.35,
+    "pre_roll_seconds": 0.25,
+    "chunk_seconds": 0.05,
+    "min_rms": 0.006,
+    "noise_multiplier": 2.4,
+    "end_noise_multiplier": 1.7,
+    "speech_start_chunks": 2
   }
 }

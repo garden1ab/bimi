@@ -69,6 +69,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ],
         "legacy_model": "wakeword.onnx"
     },
+    "recording": {
+        "start_timeout_seconds": 6.0,
+        "end_silence_seconds": 1.0,
+        "max_record_seconds": 20.0,
+        "min_speech_seconds": 0.25,
+        "noise_calibration_seconds": 0.35,
+        "pre_roll_seconds": 0.25,
+        "chunk_seconds": 0.05,
+        "min_rms": 0.006,
+        "noise_multiplier": 2.4,
+        "end_noise_multiplier": 1.7,
+        "speech_start_chunks": 2
+    },
     "ai": {
         "default_backend": "local",
         "fallback_to_local": True,
@@ -720,50 +733,155 @@ class BotGUI:
         return "WAKE"
 
     def record_voice_adaptive(self, filename: str = "input.wav") -> Optional[str]:
-        print("[AUDIO] Recording adaptive...", flush=True)
-        time.sleep(0.35)
+        """Record one wake-word utterance and stop after real post-speech silence.
+
+        USB microphones often have a noise floor above the old fixed 0.006 RMS
+        threshold.  This recorder measures the room/mic noise floor for a short
+        window, derives start/end thresholds from it, waits for speech to begin,
+        and only then counts trailing silence.
+        """
+        print("[AUDIO] Recording adaptive VAD...", flush=True)
         samplerate = choose_input_samplerate(INPUT_DEVICE, CURRENT_CONFIG.get("input_sample_rate"))
-        silence_threshold = float(CURRENT_CONFIG.get("silence_threshold", 0.006))
-        silence_duration = 1.5
-        max_record_time = 30.0
-        chunk_duration = 0.05
-        chunk_size = int(samplerate * chunk_duration)
+
+        cfg = CURRENT_CONFIG.get("recording", {})
+        legacy_min = float(CURRENT_CONFIG.get("silence_threshold", 0.006))
+        start_timeout = max(1.0, float(cfg.get("start_timeout_seconds", 6.0)))
+        end_silence = max(0.35, float(cfg.get("end_silence_seconds", 1.0)))
+        max_record_time = max(end_silence + 1.0, float(cfg.get("max_record_seconds", 20.0)))
+        min_speech_time = max(0.10, float(cfg.get("min_speech_seconds", 0.25)))
+        calibration_time = max(0.10, float(cfg.get("noise_calibration_seconds", 0.35)))
+        pre_roll_time = max(0.0, float(cfg.get("pre_roll_seconds", 0.25)))
+        chunk_duration = min(0.10, max(0.02, float(cfg.get("chunk_seconds", 0.05))))
+        min_rms = max(0.0005, float(cfg.get("min_rms", legacy_min)))
+        noise_multiplier = max(1.1, float(cfg.get("noise_multiplier", 2.4)))
+        end_noise_multiplier = max(1.05, float(cfg.get("end_noise_multiplier", 1.7)))
+        speech_start_chunks = max(1, int(cfg.get("speech_start_chunks", 2)))
+
+        chunk_size = max(1, int(samplerate * chunk_duration))
+        calibration_chunks = max(2, int(calibration_time / chunk_duration))
+        required_silent = max(1, int(end_silence / chunk_duration))
+        min_speech_chunks = max(1, int(min_speech_time / chunk_duration))
+        max_chunks = max(1, int(max_record_time / chunk_duration))
+        start_timeout_chunks = max(1, int(start_timeout / chunk_duration))
+        pre_roll_limit = max(1, int(pre_roll_time / chunk_duration))
+
         buffer: List[np.ndarray] = []
+        pre_roll: List[np.ndarray] = []
+        noise_samples: List[float] = []
+        total_chunks = 0
+        speech_chunks = 0
+        speech_run = 0
         silent_chunks = 0
-        recorded_chunks = 0
-        silence_started = False
-        required_silent = int(silence_duration / chunk_duration)
-        max_chunks = int(max_record_time / chunk_duration)
+        speech_started = False
+        stop_reason = ""
+        stop_event = threading.Event()
+        noise_floor = min_rms / noise_multiplier
+        start_threshold = min_rms
+        end_threshold = min_rms * 0.8
+
+        def rms_level(chunk: np.ndarray) -> float:
+            values = np.asarray(chunk, dtype=np.float32).reshape(-1)
+            if values.size == 0:
+                return 0.0
+            values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+            return float(np.sqrt(np.mean(values * values)))
 
         def callback(indata, frames, time_info, status):
-            nonlocal silent_chunks, recorded_chunks, silence_started
-            buffer.append(indata.copy())
-            recorded_chunks += 1
-            if recorded_chunks < 5:
+            nonlocal total_chunks, speech_chunks, speech_run, silent_chunks
+            nonlocal speech_started, stop_reason, noise_floor, start_threshold, end_threshold
+
+            chunk = indata.copy()
+            level = rms_level(chunk)
+            total_chunks += 1
+
+            if not speech_started:
+                pre_roll.append(chunk)
+                if len(pre_roll) > pre_roll_limit:
+                    del pre_roll[0]
+
+                # Learn the lower-energy room/microphone floor.  Median is much
+                # less sensitive to a cough, click, or the tail of the wake word.
+                if len(noise_samples) < calibration_chunks:
+                    noise_samples.append(level)
+                    sorted_noise = sorted(noise_samples)
+                    lower_half = sorted_noise[: max(1, (len(sorted_noise) + 1) // 2)]
+                    noise_floor = float(np.median(lower_half))
+                    start_threshold = max(min_rms, noise_floor * noise_multiplier)
+                    end_threshold = max(min_rms, noise_floor * end_noise_multiplier)
+
+                # Do not declare speech until the short noise calibration has
+                # completed.  Requiring consecutive chunks rejects clicks/noise.
+                if total_chunks >= calibration_chunks:
+                    if level >= start_threshold:
+                        speech_run += 1
+                    else:
+                        speech_run = 0
+
+                    if speech_run >= speech_start_chunks:
+                        speech_started = True
+                        speech_chunks = speech_run
+                        buffer.extend(pre_roll)
+                        pre_roll.clear()
+                        print(
+                            f"[AUDIO] Speech started: noise={noise_floor:.4f}, "
+                            f"start={start_threshold:.4f}, end={end_threshold:.4f}",
+                            flush=True,
+                        )
+                        return
+
+                if total_chunks >= start_timeout_chunks:
+                    stop_reason = "no speech detected"
+                    stop_event.set()
                 return
-            volume = np.linalg.norm(indata) / np.sqrt(max(1, len(indata)))
-            if volume < silence_threshold:
+
+            buffer.append(chunk)
+            speech_chunks += 1
+
+            if level < end_threshold:
                 silent_chunks += 1
-                if silent_chunks >= required_silent:
-                    silence_started = True
             else:
                 silent_chunks = 0
 
+            if speech_chunks >= min_speech_chunks and silent_chunks >= required_silent:
+                stop_reason = f"{end_silence:.1f}s trailing silence"
+                stop_event.set()
+                return
+
+            if total_chunks >= max_chunks:
+                stop_reason = f"{max_record_time:.1f}s safety limit"
+                stop_event.set()
+
         try:
             sd.stop()
-            time.sleep(0.1)
+            time.sleep(0.05)
             with sd.InputStream(
                 samplerate=samplerate,
                 channels=1,
                 callback=callback,
                 device=INPUT_DEVICE,
                 blocksize=chunk_size,
+                dtype="float32",
             ):
-                while not silence_started and recorded_chunks < max_chunks and not self.exiting:
-                    sd.sleep(int(chunk_duration * 1000))
+                while not stop_event.is_set() and not self.exiting:
+                    sd.sleep(25)
         except Exception as exc:
             print(f"[AUDIO] Adaptive recording failed: {exc}", flush=True)
             return None
+
+        if not speech_started:
+            print(
+                f"[AUDIO] Stopped: {stop_reason or 'no speech'} "
+                f"(noise={noise_floor:.4f}, start={start_threshold:.4f})",
+                flush=True,
+            )
+            return None
+
+        print(f"[AUDIO] Stopped: {stop_reason or 'finished'}", flush=True)
+
+        # Do not send the counted trailing silence to Whisper.
+        if silent_chunks > 0 and len(buffer) > silent_chunks:
+            del buffer[-silent_chunks:]
+
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename: str = "input.wav") -> Optional[str]:
