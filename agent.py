@@ -408,6 +408,8 @@ class BotGUI:
         self.tts_thread: Optional[threading.Thread] = None
         self.main_thread: Optional[threading.Thread] = None
         self.watchdog_thread: Optional[threading.Thread] = None
+        self.motion_init_thread: Optional[threading.Thread] = None
+        self.warmup_thread: Optional[threading.Thread] = None
         self.current_audio_process: Optional[subprocess.Popen] = None
         self.exiting = False
         self.last_ptt_time = 0.0
@@ -417,7 +419,12 @@ class BotGUI:
         self.ai = AIBackendManager(CURRENT_CONFIG.get("ai", {}), OLLAMA_OPTIONS)
         self.motion = MPU6050Monitor(CURRENT_CONFIG.get("hardware", {}).get("mpu6050", {}))
         self.vision = CameraVision(CURRENT_CONFIG.get("camera", {}))
-        self.motion.start()
+
+        # IMPORTANT: never initialize I2C hardware synchronously here. SMBus/I2C
+        # transactions can stall when the sensor/bus is disconnected or wedged.
+        # The previous build called motion.start() before the wake/main threads,
+        # which could leave the GUI visible but with no active microphone listener.
+        # Motion initialization is started asynchronously after input is online.
 
         print("[INIT] Loading wake words...", flush=True)
         self.oww_model = None
@@ -512,6 +519,9 @@ class BotGUI:
 
         self.load_animations()
         self.update_animation()
+
+        # Bring voice input online first. Sensor initialization must never gate
+        # wake-word or Enter/PTT availability.
         self._start_main_thread()
         self.watchdog_thread = threading.Thread(
             target=self._runtime_watchdog,
@@ -519,6 +529,7 @@ class BotGUI:
             name="agent-watchdog",
         )
         self.watchdog_thread.start()
+        self._start_motion_init_thread()
 
     # ------------------------------------------------------------------
     # GUI helpers
@@ -718,6 +729,41 @@ class BotGUI:
         self.main_thread = threading.Thread(target=self.safe_main_execution, daemon=True, name="agent-main")
         self.main_thread.start()
 
+    def _start_motion_init_thread(self):
+        """Initialize/retry the MPU-6050 without ever blocking voice startup."""
+        if self.exiting:
+            return
+        if self.motion_init_thread is not None and self.motion_init_thread.is_alive():
+            return
+        self.motion_init_thread = threading.Thread(
+            target=self._motion_init_worker,
+            daemon=True,
+            name="mpu6050-init",
+        )
+        self.motion_init_thread.start()
+
+    def _motion_init_worker(self):
+        retry_seconds = max(2.0, float(
+            CURRENT_CONFIG.get("hardware", {}).get("mpu6050", {}).get("retry_seconds", 10.0)
+        ))
+        attempt = 0
+        while not self.exiting:
+            attempt += 1
+            try:
+                print(f"[MPU6050] Async initialization attempt {attempt}...", flush=True)
+                if self.motion.start():
+                    print("[MPU6050] Sensor online; motion/orientation context enabled.", flush=True)
+                    return
+                err = self.motion.snapshot().get("last_error", "unknown error")
+                print(f"[MPU6050] Not ready: {err}. Retrying in {retry_seconds:.0f}s.", flush=True)
+            except Exception as exc:
+                print(f"[MPU6050] Async initialization failed: {exc}. Retrying in {retry_seconds:.0f}s.", flush=True)
+
+            # Event-style sleep so shutdown does not have to wait the whole retry interval.
+            deadline = time.monotonic() + retry_seconds
+            while not self.exiting and time.monotonic() < deadline:
+                time.sleep(0.25)
+
     def _runtime_watchdog(self):
         """Keep worker threads alive and recover from a dead main loop.
 
@@ -772,15 +818,14 @@ class BotGUI:
         self._ensure_tts_worker()
 
     def safe_main_execution(self):
-        # Initialization errors should not permanently kill manual/wake input.
+        # Voice input is the primary control path, so it must never wait for an
+        # AI/network warmup.  Start warmup in the background and enter the wake
+        # loop immediately.  The first request may be slower if the model is not
+        # loaded yet, but Hey BMO and Enter remain responsive.
         if not self.warmed_up:
-            try:
-                self.warm_up_logic()
-            except Exception as exc:
-                traceback.print_exc()
-                print(f"[INIT] Warmup failed but listener will continue: {exc}", flush=True)
-                self.set_state(BotStates.ERROR, "Warmup failed; continuing offline.")
             self.warmed_up = True
+            self.set_state(BotStates.IDLE, "Ready - listening for wake or Enter.")
+            self._start_background_warmup()
 
         self._ensure_tts_worker()
 
@@ -835,15 +880,29 @@ class BotGUI:
                 time.sleep(0.35)
                 self.set_state(BotStates.IDLE, "Recovered - waiting for wake or Enter.")
 
-    def warm_up_logic(self):
-        self.set_state(BotStates.WARMUP, "Warming up local AI...")
+    def _start_background_warmup(self):
+        if self.exiting:
+            return
+        if self.warmup_thread is not None and self.warmup_thread.is_alive():
+            return
+        self.warmup_thread = threading.Thread(
+            target=self._background_warmup_worker,
+            daemon=True,
+            name="ai-warmup",
+        )
+        self.warmup_thread.start()
+
+    def _background_warmup_worker(self):
         try:
+            print("[AI] Background warmup started; voice input remains active.", flush=True)
             self.ai.warmup()
-            print(f"[AI] {self.ai.status_text()}", flush=True)
+            print(f"[AI] Background warmup complete: {self.ai.status_text()}", flush=True)
         except Exception as exc:
-            print(f"[AI] Warmup warning: {exc}", flush=True)
-        self.play_sound(self.get_random_sound(greeting_sounds_dir))
-        self.set_state(BotStates.IDLE, "Ready")
+            print(f"[AI] Background warmup warning: {exc}", flush=True)
+
+    def warm_up_logic(self):
+        """Compatibility wrapper; warmup is intentionally non-blocking now."""
+        self._start_background_warmup()
 
     # ------------------------------------------------------------------
     # Wake word and recording
