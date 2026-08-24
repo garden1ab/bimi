@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MODEL="${THOR_MODEL:-qwen3.5:27b}"
+MODEL="${THOR_MODEL:-qwen3.8:27b}"
 
 echo "Configuring Jetson AGX Thor as a LAN Ollama LLM/VLM server."
 echo "This exposes port 11434 on the LAN; restrict access with your firewall/router."

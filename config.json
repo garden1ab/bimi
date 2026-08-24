@@ -39,15 +39,15 @@
       "thor": {
         "type": "ollama",
         "base_url": "http://jetson-thor.local:11434",
-        "text_model": "qwen3.5:27b",
-        "vision_model": "qwen3.5:27b",
+        "text_model": "qwen3.8:27b",
+        "vision_model": "qwen3.8:27b",
         "text_models": [
-          "qwen3.5:9b",
+          "qwen3.8:27b",
           "qwen3.5:27b",
           "qwen3.5:35b"
         ],
         "vision_models": [
-          "qwen3.5:9b",
+          "qwen3.8:27b",
           "qwen3.5:27b"
         ],
         "aliases": [
