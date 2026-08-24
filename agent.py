@@ -13,6 +13,7 @@ import os
 import random
 import re
 import select
+import queue
 import subprocess
 import sys
 import threading
@@ -383,10 +384,11 @@ class BotGUI:
         self.master = master
         master.title("Pi Assistant")
         master.attributes("-fullscreen", True)
-        master.bind("<Escape>", self.exit_fullscreen)
-        master.bind("<Return>", self.handle_ptt_toggle)
-        master.bind("<space>", self.handle_speaking_interrupt)
-        atexit.register(self.safe_exit)
+        # bind_all keeps recovery keys working regardless of which widget owns focus.
+        master.bind_all("<Escape>", self.exit_fullscreen)
+        master.bind_all("<Return>", self.handle_ptt_toggle)
+        master.bind_all("<KP_Enter>", self.handle_ptt_toggle)
+        master.bind_all("<space>", self.handle_speaking_interrupt)
 
         self.current_state = BotStates.WARMUP
         self.current_volume = 0
@@ -410,6 +412,9 @@ class BotGUI:
         self.watchdog_thread: Optional[threading.Thread] = None
         self.motion_init_thread: Optional[threading.Thread] = None
         self.warmup_thread: Optional[threading.Thread] = None
+        self.wake_loader_thread: Optional[threading.Thread] = None
+        self.wake_model_ready = threading.Event()
+        self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self.current_audio_process: Optional[subprocess.Popen] = None
         self.exiting = False
         self.last_ptt_time = 0.0
@@ -426,75 +431,13 @@ class BotGUI:
         # which could leave the GUI visible but with no active microphone listener.
         # Motion initialization is started asynchronously after input is online.
 
-        print("[INIT] Loading wake words...", flush=True)
+        # Wake-word model construction can take seconds on a Pi and must never
+        # run on Tk's event thread. Configure metadata here; the ONNX models are
+        # loaded by a daemon worker after the GUI event loop is alive.
         self.oww_model = None
-        self.wake_word_threshold = 0.5
+        self.wake_word_threshold = float(CURRENT_CONFIG.get("wake_word", {}).get("threshold", 0.5))
         self.wake_word_phrases: List[str] = []
         self.wake_word_labels: Dict[str, str] = {}
-        wake_cfg = CURRENT_CONFIG.get("wake_word", {})
-        if wake_cfg.get("enabled", True):
-            self.wake_word_threshold = float(wake_cfg.get("threshold", 0.5))
-            wake_models: List[str] = []
-            for entry in wake_cfg.get("models", []):
-                if not isinstance(entry, dict):
-                    continue
-                phrase = str(entry.get("phrase", "Wake word")).strip()
-                path = str(entry.get("path", "")).strip()
-                model_name = str(entry.get("model", "")).strip()
-                if path:
-                    if os.path.exists(path):
-                        wake_models.append(path)
-                        self.wake_word_phrases.append(phrase)
-                        self.wake_word_labels[Path(path).stem] = phrase
-                    else:
-                        print(f"[WAKE] Optional model missing for {phrase}: {path}", flush=True)
-                elif model_name:
-                    # Resolve official model names to their downloaded ONNX path.
-                    # This avoids API/version differences around passing model names directly.
-                    model_meta = getattr(openwakeword, "MODELS", {}).get(model_name, {})
-                    model_path = str(model_meta.get("model_path", ""))
-                    if model_path.endswith(".tflite"):
-                        model_path = model_path[:-7] + ".onnx"
-                    if model_path and os.path.exists(model_path):
-                        wake_models.append(model_path)
-                        self.wake_word_phrases.append(phrase)
-                        self.wake_word_labels[Path(model_path).stem] = phrase
-                    else:
-                        print(
-                            f"[WAKE] Built-in model missing for {phrase} ({model_name}). "
-                            "Run ./install_wake_words.sh.",
-                            flush=True,
-                        )
-
-            # Preserve compatibility with the original single wakeword.onnx.
-            # It is only used if none of the explicitly configured models can be used.
-            if not wake_models:
-                legacy_model = str(wake_cfg.get("legacy_model", "wakeword.onnx")).strip()
-                if legacy_model and os.path.exists(legacy_model):
-                    wake_models = [legacy_model]
-                    self.wake_word_phrases = ["Hey Jarvis (legacy/default)"]
-                    self.wake_word_labels[Path(legacy_model).stem] = "Hey Jarvis"
-
-            if wake_models:
-                try:
-                    try:
-                        self.oww_model = Model(
-                            wakeword_models=wake_models,
-                            inference_framework="onnx",
-                        )
-                    except TypeError:
-                        # Compatibility with older openWakeWord releases.
-                        self.oww_model = Model(wakeword_model_paths=wake_models)
-                    print(
-                        "[INIT] Wake words loaded: " + ", ".join(self.wake_word_phrases),
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(f"[WAKE] Could not load wake-word models: {exc}", flush=True)
-            else:
-                print("[WAKE] No wake-word models are available; PTT only.", flush=True)
-        else:
-            print("[WAKE] Wake-word detection disabled in config.json; PTT only.", flush=True)
 
         self.background_label = tk.Label(master)
         self.background_label.place(x=0, y=0, width=self.BG_WIDTH, height=self.BG_HEIGHT)
@@ -519,52 +462,73 @@ class BotGUI:
 
         self.load_animations()
         self.update_animation()
+        self.master.after(50, self._drain_ui_queue)
 
-        # Bring voice input online first. Sensor initialization must never gate
-        # wake-word or Enter/PTT availability.
-        self._start_main_thread()
-        self.watchdog_thread = threading.Thread(
-            target=self._runtime_watchdog,
-            daemon=True,
-            name="agent-watchdog",
-        )
-        self.watchdog_thread.start()
-        self._start_motion_init_thread()
+        # Do not start worker threads until Tk's mainloop has had a chance to
+        # start. Calling Tk methods from a worker before mainloop is running can
+        # deadlock Tcl/Tk and make Escape/Enter appear completely frozen.
+        self.master.after(100, self._start_runtime_workers)
 
     # ------------------------------------------------------------------
     # GUI helpers
     # ------------------------------------------------------------------
     def safe_exit(self):
+        """Immediate non-blocking UI shutdown.
+
+        Hardware/network cleanup must not run on Tk's event thread. A wedged
+        PortAudio/Ollama/I2C call previously made Escape look broken because the
+        key handler itself blocked. Worker threads are daemon threads, so closing
+        the Tk window is enough to terminate the process cleanly.
+        """
         if self.exiting:
             return
         self.exiting = True
-        print("\n--- SHUTDOWN SEQUENCE ---", flush=True)
+        print("\n--- SHUTDOWN REQUESTED ---", flush=True)
+        self.interrupted.set()
+        self.ptt_event.set()
         self.recording_active.clear()
         self.thinking_sound_active.clear()
-        self.interrupted.set()
-        with self.tts_queue_lock:
-            self.tts_queue.clear()
-        if self.current_audio_process:
+        try:
+            self.save_chat_history()
+        except Exception:
+            pass
+        # Best-effort cleanup occurs off the GUI thread. Never wait for it.
+        threading.Thread(target=self._background_cleanup, daemon=True, name="shutdown-cleanup").start()
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
+
+    def _background_cleanup(self):
+        try:
+            with self.tts_queue_lock:
+                self.tts_queue.clear()
+        except Exception:
+            pass
+        process = self.current_audio_process
+        if process:
             try:
-                self.current_audio_process.terminate()
+                process.terminate()
             except Exception:
                 pass
-        self.save_chat_history()
-        self.motion.stop()
-        self.vision.close()
-        self.ai.unload()
         try:
             sd.stop()
         except Exception:
             pass
         try:
-            self.master.quit()
+            self.motion.stop()
         except Exception:
             pass
+        try:
+            self.vision.close()
+        except Exception:
+            pass
+        # Do not call ai.unload() here. A dead Ollama endpoint can block during
+        # shutdown; the server can manage model residency independently.
 
     def exit_fullscreen(self, event=None):
-        self.master.attributes("-fullscreen", False)
         self.safe_exit()
+        return "break"
 
     def toggle_hud_visibility(self, event=None):
         try:
@@ -580,54 +544,53 @@ class BotGUI:
             pass
 
     def handle_ptt_toggle(self, event=None):
-        """Keyboard wake/recovery trigger.
-
-        Enter now behaves like a manual wake word by default: one press starts
-        adaptive VAD recording and silence ends the utterance.  If the agent is
-        busy or wedged, Enter also requests cancellation and queues a fresh wake
-        so the user does not need to restart the GUI.
-        """
+        """Queue a manual wake without blocking Tk's event thread."""
         now = time.time()
         if now - self.last_ptt_time < 0.35:
-            return
+            return "break"
         self.last_ptt_time = now
 
-        # Legacy hold/toggle PTT remains available through config.
         keyboard_mode = str(CURRENT_CONFIG.get("runtime", {}).get("keyboard_trigger_mode", "vad")).lower()
         if keyboard_mode in {"toggle", "hold", "ptt"}:
             if self.recording_active.is_set():
                 self.recording_active.clear()
-                return
+                return "break"
             self.recording_active.set()
 
         busy_states = {
-            BotStates.LISTENING,
-            BotStates.THINKING,
-            BotStates.SPEAKING,
-            BotStates.CAPTURING,
-            BotStates.ERROR,
+            BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING,
+            BotStates.CAPTURING, BotStates.ERROR,
         }
         if self.current_state in busy_states:
-            print(f"[RECOVERY] Enter pressed while {self.current_state}; interrupting and queuing manual wake.", flush=True)
-            self._interrupt_current_work(queue_ptt=True)
-            return
+            print(f"[RECOVERY] Enter pressed while {self.current_state}; cancellation queued.", flush=True)
+            # Set the flags immediately, then perform potentially blocking audio/
+            # HTTP cancellation in a daemon worker. Tk returns to its event loop
+            # immediately so Enter and Escape stay responsive.
+            self.interrupted.set()
+            self.ptt_event.set()
+            threading.Thread(
+                target=self._interrupt_current_work,
+                kwargs={"queue_ptt": True},
+                daemon=True,
+                name="manual-recovery",
+            ).start()
+            return "break"
 
         self.ptt_event.set()
         self._touch_progress("manual wake queued")
+        return "break"
 
     def handle_speaking_interrupt(self, event=None):
         if self.current_state not in (BotStates.SPEAKING, BotStates.THINKING):
-            return
+            return "break"
         self.interrupted.set()
-        self.thinking_sound_active.clear()
-        with self.tts_queue_lock:
-            self.tts_queue.clear()
-        if self.current_audio_process:
-            try:
-                self.current_audio_process.terminate()
-            except Exception:
-                pass
-        self.set_state(BotStates.IDLE, "Interrupted.")
+        threading.Thread(
+            target=self._interrupt_current_work,
+            kwargs={"queue_ptt": False},
+            daemon=True,
+            name="speech-interrupt",
+        ).start()
+        return "break"
 
     def load_animations(self):
         states = ["idle", "listening", "thinking", "speaking", "error", "capturing", "warmup"]
@@ -662,45 +625,59 @@ class BotGUI:
         self.master.after(50 if self.current_state == BotStates.SPEAKING else 500, self.update_animation)
 
     def set_state(self, state: str, msg: str = "", cam_path: Optional[str] = None):
-        # Update the logical state immediately. UI widgets are still mutated on
-        # Tk's thread below, but input/recovery handlers no longer depend on a
-        # delayed ``after()`` callback to know whether the agent is busy.
+        # Logical state is thread-safe enough for event routing. Widget mutation
+        # is marshalled through ui_queue and performed only by Tk's main thread.
         if self.current_state != state:
             self.current_state = state
             self.current_frame_index = 0
         self._touch_progress(f"state={state}")
-
-        def _update():
-            if msg:
-                print(f"[STATE] {state.upper()}: {msg}", flush=True)
-            if msg:
-                self.status_var.set(msg)
-            show_path = cam_path if cam_path and os.path.exists(cam_path) else None
-            if show_path and state in (BotStates.THINKING, BotStates.SPEAKING):
-                try:
-                    image = Image.open(show_path)
-                    image.thumbnail((self.OVERLAY_WIDTH, self.OVERLAY_HEIGHT))
-                    self.current_overlay_image = ImageTk.PhotoImage(image)
-                    self.overlay_label.config(image=self.current_overlay_image)
-                    self.overlay_label.place(relx=0.5, rely=0.40, anchor=tk.CENTER)
-                    return
-                except Exception:
-                    pass
-            self.overlay_label.place_forget()
-
         try:
-            self.master.after(0, _update)
-        except tk.TclError:
+            self.ui_queue.put_nowait(("state", state, msg, cam_path))
+        except Exception:
             pass
 
     def append_to_text(self, text: str, newline: bool = True):
-        def _update():
-            self.response_text.config(state=tk.NORMAL)
-            self.response_text.insert(tk.END, text + ("\n" if newline else ""))
-            self.response_text.see(tk.END)
-            self.response_text.config(state=tk.DISABLED)
         try:
-            self.master.after(0, _update)
+            self.ui_queue.put_nowait(("text", text, newline))
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        if self.exiting:
+            return
+        try:
+            while True:
+                item = self.ui_queue.get_nowait()
+                kind = item[0]
+                if kind == "state":
+                    _, state, msg, cam_path = item
+                    if msg:
+                        print(f"[STATE] {str(state).upper()}: {msg}", flush=True)
+                        self.status_var.set(msg)
+                    show_path = cam_path if cam_path and os.path.exists(cam_path) else None
+                    if show_path and state in (BotStates.THINKING, BotStates.SPEAKING):
+                        try:
+                            image = Image.open(show_path)
+                            image.thumbnail((self.OVERLAY_WIDTH, self.OVERLAY_HEIGHT))
+                            self.current_overlay_image = ImageTk.PhotoImage(image)
+                            self.overlay_label.config(image=self.current_overlay_image)
+                            self.overlay_label.place(relx=0.5, rely=0.40, anchor=tk.CENTER)
+                            continue
+                        except Exception:
+                            pass
+                    self.overlay_label.place_forget()
+                elif kind == "text":
+                    _, text, newline = item
+                    self.response_text.config(state=tk.NORMAL)
+                    self.response_text.insert(tk.END, text + ("\n" if newline else ""))
+                    self.response_text.see(tk.END)
+                    self.response_text.config(state=tk.DISABLED)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        try:
+            self.master.after(50, self._drain_ui_queue)
         except tk.TclError:
             pass
 
@@ -720,6 +697,88 @@ class BotGUI:
                 print("[WATCHDOG] Restarting stopped TTS worker.", flush=True)
             self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True, name="tts-worker")
             self.tts_thread.start()
+
+    def _start_runtime_workers(self):
+        """Called by Tk after mainloop starts; never blocks the GUI."""
+        if self.exiting:
+            return
+        print("[RUNTIME] Tk event loop online; starting voice/background workers.", flush=True)
+        self._start_wake_loader_thread()
+        self._start_main_thread()
+        self.watchdog_thread = threading.Thread(
+            target=self._runtime_watchdog, daemon=True, name="agent-watchdog"
+        )
+        self.watchdog_thread.start()
+        self._start_motion_init_thread()
+        # AI warmup is intentionally delayed/background-only. Voice input is
+        # available regardless of Ollama/Thor state.
+        self._start_background_warmup()
+
+    def _start_wake_loader_thread(self):
+        if self.exiting:
+            return
+        if self.wake_loader_thread is not None and self.wake_loader_thread.is_alive():
+            return
+        self.wake_loader_thread = threading.Thread(
+            target=self._wake_loader_worker, daemon=True, name="wake-model-loader"
+        )
+        self.wake_loader_thread.start()
+
+    def _wake_loader_worker(self):
+        print("[INIT] Loading wake words in background...", flush=True)
+        wake_cfg = CURRENT_CONFIG.get("wake_word", {})
+        try:
+            if not wake_cfg.get("enabled", True):
+                print("[WAKE] Wake-word detection disabled; Enter remains available.", flush=True)
+                return
+            wake_models: List[str] = []
+            phrases: List[str] = []
+            labels: Dict[str, str] = {}
+            for entry in wake_cfg.get("models", []):
+                if not isinstance(entry, dict):
+                    continue
+                phrase = str(entry.get("phrase", "Wake word")).strip()
+                path = str(entry.get("path", "")).strip()
+                model_name = str(entry.get("model", "")).strip()
+                if path:
+                    if os.path.exists(path):
+                        wake_models.append(path)
+                        phrases.append(phrase)
+                        labels[Path(path).stem] = phrase
+                    else:
+                        print(f"[WAKE] Optional model missing for {phrase}: {path}", flush=True)
+                elif model_name:
+                    model_meta = getattr(openwakeword, "MODELS", {}).get(model_name, {})
+                    model_path = str(model_meta.get("model_path", ""))
+                    if model_path.endswith(".tflite"):
+                        model_path = model_path[:-7] + ".onnx"
+                    if model_path and os.path.exists(model_path):
+                        wake_models.append(model_path)
+                        phrases.append(phrase)
+                        labels[Path(model_path).stem] = phrase
+                    else:
+                        print(f"[WAKE] Built-in model missing for {phrase} ({model_name}).", flush=True)
+            if not wake_models:
+                legacy_model = str(wake_cfg.get("legacy_model", "wakeword.onnx")).strip()
+                if legacy_model and os.path.exists(legacy_model):
+                    wake_models = [legacy_model]
+                    phrases = ["Hey Jarvis"]
+                    labels[Path(legacy_model).stem] = "Hey Jarvis"
+            if not wake_models:
+                print("[WAKE] No wake-word model available; Enter remains available.", flush=True)
+                return
+            try:
+                model = Model(wakeword_models=wake_models, inference_framework="onnx")
+            except TypeError:
+                model = Model(wakeword_model_paths=wake_models)
+            self.oww_model = model
+            self.wake_word_phrases = phrases
+            self.wake_word_labels = labels
+            print("[INIT] Wake words loaded: " + ", ".join(phrases), flush=True)
+        except Exception as exc:
+            print(f"[WAKE] Could not load wake-word models: {exc}; Enter remains available.", flush=True)
+        finally:
+            self.wake_model_ready.set()
 
     def _start_main_thread(self):
         if self.exiting:
@@ -914,12 +973,20 @@ class BotGUI:
         if self.ptt_event.is_set():
             self.ptt_event.clear()
             return "PTT"
+        # Wake models load asynchronously so the GUI never blocks. Enter must
+        # work immediately even while ONNX initialization is still happening.
+        while self.oww_model is None and not self.exiting:
+            if self.ptt_event.wait(timeout=0.10):
+                self.ptt_event.clear()
+                return "PTT"
+            if self.wake_model_ready.is_set() and self.oww_model is None:
+                # Loading failed/disabled. Continue polling for Enter without
+                # blocking forever in Event.wait(), which also aids shutdown.
+                continue
+        if self.exiting:
+            return "PTT"
         if self.oww_model:
             self.oww_model.reset()
-        if self.oww_model is None:
-            self.ptt_event.wait()
-            self.ptt_event.clear()
-            return "PTT"
 
         target_size = 1280
         target_rate = 16000
