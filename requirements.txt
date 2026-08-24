@@ -1,0 +1,11 @@
+sounddevice
+numpy
+scipy
+openwakeword
+onnxruntime
+ollama
+requests
+smbus2
+gpiozero
+ddgs
+Pillow

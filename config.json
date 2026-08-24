@@ -1,0 +1,92 @@
+{
+  "voice_model": "piper/en_GB-semaine-medium.onnx",
+  "chat_memory": true,
+  "system_prompt_extras": "",
+  "input_device": "USB",
+  "input_sample_rate": null,
+  "output_device": "MAX98357A",
+  "ai": {
+    "default_backend": "local",
+    "fallback_to_local": true,
+    "backends": {
+      "local": {
+        "type": "ollama",
+        "base_url": "http://127.0.0.1:11434",
+        "text_model": "qwen3.5:2b",
+        "vision_model": "qwen3.5:2b",
+        "text_models": [
+          "qwen3.5:0.8b",
+          "qwen3.5:2b",
+          "qwen3:1.7b"
+        ],
+        "vision_models": [
+          "qwen3.5:0.8b",
+          "qwen3.5:2b"
+        ],
+        "aliases": [
+          "local",
+          "pi",
+          "raspberry pi"
+        ],
+        "keep_alive": "-1"
+      },
+      "thor": {
+        "type": "ollama",
+        "base_url": "http://jetson-thor.local:11434",
+        "text_model": "qwen3.5:27b",
+        "vision_model": "qwen3.5:27b",
+        "text_models": [
+          "qwen3.5:9b",
+          "qwen3.5:27b",
+          "qwen3.5:35b"
+        ],
+        "vision_models": [
+          "qwen3.5:9b",
+          "qwen3.5:27b"
+        ],
+        "aliases": [
+          "thor",
+          "server",
+          "jetson",
+          "jetson thor"
+        ],
+        "keep_alive": "-1"
+      }
+    }
+  },
+  "hardware": {
+    "mpu6050": {
+      "enabled": true,
+      "i2c_bus": 1,
+      "address": "0x68",
+      "sda_gpio": 2,
+      "scl_gpio": 3,
+      "interrupt_gpio": 24,
+      "poll_hz": 20,
+      "accel_delta_threshold_g": 0.08,
+      "accel_magnitude_threshold_g": 0.12,
+      "gyro_threshold_dps": 18.0,
+      "motion_hold_seconds": 2.5,
+      "interrupt_threshold_mg": 80,
+      "interrupt_duration_ms": 20
+    },
+    "max98357a": {
+      "enabled": true,
+      "din_gpio": 21,
+      "bclk_gpio": 18,
+      "lrclk_gpio": 19
+    }
+  },
+  "camera": {
+    "image_path": "current_image.jpg",
+    "width": 640,
+    "height": 480,
+    "rotation": 180,
+    "camera_warmup_ms": 500,
+    "hailo_enabled": true,
+    "hailo_model_path": null,
+    "hailo_threshold": 0.45,
+    "max_detections": 12,
+    "labels_path": "assets/coco.txt"
+  }
+}
