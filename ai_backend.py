@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+import httpx
 
 try:
     import ollama
@@ -184,6 +185,20 @@ class AIBackendManager:
 
         return None
 
+    def cancel_pending_requests(self) -> None:
+        """Close live HTTP clients so a manual recovery can abort stuck I/O.
+
+        New clients are created lazily on the next request. This is especially
+        useful when a Thor server disappears while an Ollama request is active.
+        """
+        clients = list(self._ollama_clients.values())
+        self._ollama_clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Public inference API
     # ------------------------------------------------------------------
@@ -297,7 +312,13 @@ class AIBackendManager:
         if backend not in self._ollama_clients:
             cfg = self.backend_config(backend)
             host = cfg.get("base_url", "http://127.0.0.1:11434")
-            self._ollama_clients[backend] = ollama.Client(host=host)
+            # ollama-python intentionally defaults to timeout=None. That is fine
+            # for a CLI, but a voice robot can otherwise become permanently
+            # unresponsive when a remote Thor disappears mid-request.
+            request_timeout = max(5.0, float(cfg.get("timeout_seconds", 60.0)))
+            connect_timeout = max(1.0, float(cfg.get("connect_timeout_seconds", 4.0)))
+            timeout = httpx.Timeout(request_timeout, connect=connect_timeout)
+            self._ollama_clients[backend] = ollama.Client(host=host, timeout=timeout)
         return self._ollama_clients[backend]
 
     def _chat_ollama(

@@ -53,7 +53,13 @@ class CameraVision:
             "--height", str(self.height),
             "-o", path,
         ]
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=max(3.0, float(self.config.get("capture_timeout_seconds", 12.0))),
+        )
         if self.rotation:
             image = Image.open(path)
             image = image.rotate(self.rotation, expand=True)

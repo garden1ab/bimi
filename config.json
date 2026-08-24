@@ -34,7 +34,9 @@
           "num_ctx": 2048,
           "num_predict": 96,
           "temperature": 0.4
-        }
+        },
+        "connect_timeout_seconds": 3.0,
+        "timeout_seconds": 90.0
       },
       "thor": {
         "type": "ollama",
@@ -64,7 +66,9 @@
           "num_ctx": 8192,
           "num_predict": 256,
           "temperature": 0.5
-        }
+        },
+        "connect_timeout_seconds": 3.0,
+        "timeout_seconds": 45.0
       }
     }
   },
@@ -101,7 +105,8 @@
     "hailo_model_path": null,
     "hailo_threshold": 0.45,
     "max_detections": 12,
-    "labels_path": "assets/coco.txt"
+    "labels_path": "assets/coco.txt",
+    "capture_timeout_seconds": 12.0
   },
   "wake_word": {
     "enabled": true,
@@ -144,5 +149,13 @@
     "enabled": true,
     "delay_seconds": 0.25,
     "announce_once": true
+  },
+  "runtime": {
+    "keyboard_trigger_mode": "vad",
+    "watchdog_interval_seconds": 2.0,
+    "stt_timeout_seconds": 60.0,
+    "tts_timeout_seconds": 35.0,
+    "piper_process_timeout_seconds": 30.0,
+    "debug_progress": false
   }
 }

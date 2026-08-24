@@ -387,9 +387,13 @@ class BotGUI:
         self.tts_queue: List[str] = []
         self.tts_queue_lock = threading.Lock()
         self.tts_thread: Optional[threading.Thread] = None
+        self.main_thread: Optional[threading.Thread] = None
+        self.watchdog_thread: Optional[threading.Thread] = None
         self.current_audio_process: Optional[subprocess.Popen] = None
         self.exiting = False
         self.last_ptt_time = 0.0
+        self.last_progress_time = time.monotonic()
+        self.warmed_up = False
 
         self.ai = AIBackendManager(CURRENT_CONFIG.get("ai", {}), OLLAMA_OPTIONS)
         self.motion = MPU6050Monitor(CURRENT_CONFIG.get("hardware", {}).get("mpu6050", {}))
@@ -489,7 +493,13 @@ class BotGUI:
 
         self.load_animations()
         self.update_animation()
-        threading.Thread(target=self.safe_main_execution, daemon=True, name="agent-main").start()
+        self._start_main_thread()
+        self.watchdog_thread = threading.Thread(
+            target=self._runtime_watchdog,
+            daemon=True,
+            name="agent-watchdog",
+        )
+        self.watchdog_thread.start()
 
     # ------------------------------------------------------------------
     # GUI helpers
@@ -540,15 +550,40 @@ class BotGUI:
             pass
 
     def handle_ptt_toggle(self, event=None):
+        """Keyboard wake/recovery trigger.
+
+        Enter now behaves like a manual wake word by default: one press starts
+        adaptive VAD recording and silence ends the utterance.  If the agent is
+        busy or wedged, Enter also requests cancellation and queues a fresh wake
+        so the user does not need to restart the GUI.
+        """
         now = time.time()
-        if now - self.last_ptt_time < 0.5:
+        if now - self.last_ptt_time < 0.35:
             return
         self.last_ptt_time = now
-        if self.recording_active.is_set():
-            self.recording_active.clear()
-        elif self.current_state == BotStates.IDLE or "Wait" in self.status_var.get():
+
+        # Legacy hold/toggle PTT remains available through config.
+        keyboard_mode = str(CURRENT_CONFIG.get("runtime", {}).get("keyboard_trigger_mode", "vad")).lower()
+        if keyboard_mode in {"toggle", "hold", "ptt"}:
+            if self.recording_active.is_set():
+                self.recording_active.clear()
+                return
             self.recording_active.set()
-            self.ptt_event.set()
+
+        busy_states = {
+            BotStates.LISTENING,
+            BotStates.THINKING,
+            BotStates.SPEAKING,
+            BotStates.CAPTURING,
+            BotStates.ERROR,
+        }
+        if self.current_state in busy_states:
+            print(f"[RECOVERY] Enter pressed while {self.current_state}; interrupting and queuing manual wake.", flush=True)
+            self._interrupt_current_work(queue_ptt=True)
+            return
+
+        self.ptt_event.set()
+        self._touch_progress("manual wake queued")
 
     def handle_speaking_interrupt(self, event=None):
         if self.current_state not in (BotStates.SPEAKING, BotStates.THINKING):
@@ -597,12 +632,17 @@ class BotGUI:
         self.master.after(50 if self.current_state == BotStates.SPEAKING else 500, self.update_animation)
 
     def set_state(self, state: str, msg: str = "", cam_path: Optional[str] = None):
+        # Update the logical state immediately. UI widgets are still mutated on
+        # Tk's thread below, but input/recovery handlers no longer depend on a
+        # delayed ``after()`` callback to know whether the agent is busy.
+        if self.current_state != state:
+            self.current_state = state
+            self.current_frame_index = 0
+        self._touch_progress(f"state={state}")
+
         def _update():
             if msg:
                 print(f"[STATE] {state.upper()}: {msg}", flush=True)
-            if self.current_state != state:
-                self.current_state = state
-                self.current_frame_index = 0
             if msg:
                 self.status_var.set(msg)
             show_path = cam_path if cam_path and os.path.exists(cam_path) else None
@@ -637,27 +677,123 @@ class BotGUI:
     # ------------------------------------------------------------------
     # Main listening loop
     # ------------------------------------------------------------------
-    def safe_main_execution(self):
-        try:
-            self.warm_up_logic()
+    def _touch_progress(self, reason: str = ""):
+        self.last_progress_time = time.monotonic()
+        if reason and CURRENT_CONFIG.get("runtime", {}).get("debug_progress", False):
+            print(f"[WATCHDOG] progress: {reason}", flush=True)
+
+    def _ensure_tts_worker(self):
+        if self.exiting:
+            return
+        if self.tts_thread is None or not self.tts_thread.is_alive():
+            if self.tts_thread is not None:
+                print("[WATCHDOG] Restarting stopped TTS worker.", flush=True)
             self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True, name="tts-worker")
             self.tts_thread.start()
 
-            while not self.exiting:
+    def _start_main_thread(self):
+        if self.exiting:
+            return
+        if self.main_thread is not None and self.main_thread.is_alive():
+            return
+        self.main_thread = threading.Thread(target=self.safe_main_execution, daemon=True, name="agent-main")
+        self.main_thread.start()
+
+    def _runtime_watchdog(self):
+        """Keep worker threads alive and recover from a dead main loop.
+
+        Network/audio operations have their own finite timeouts.  This watchdog
+        handles the other important failure mode: an unexpected exception that
+        kills a worker while leaving the Tk GUI running.
+        """
+        interval = max(1.0, float(CURRENT_CONFIG.get("runtime", {}).get("watchdog_interval_seconds", 2.0)))
+        while not self.exiting:
+            try:
+                self._ensure_tts_worker()
+                if self.main_thread is not None and not self.main_thread.is_alive():
+                    print("[WATCHDOG] agent-main stopped unexpectedly; restarting it.", flush=True)
+                    self._start_main_thread()
+            except Exception as exc:
+                print(f"[WATCHDOG] recovery check failed: {exc}", flush=True)
+            time.sleep(interval)
+
+    def _interrupt_current_work(self, *, queue_ptt: bool = False):
+        """Best-effort cancellation used by Enter and error recovery."""
+        self.interrupted.set()
+        self.thinking_sound_active.clear()
+        self.recording_active.clear()
+        with self.tts_queue_lock:
+            self.tts_queue.clear()
+        process = self.current_audio_process
+        if process:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        try:
+            self.ai.cancel_pending_requests()
+        except Exception:
+            pass
+        if queue_ptt:
+            self.ptt_event.set()
+        self._touch_progress("interrupt requested")
+
+    def _reset_after_cycle_error(self):
+        self.thinking_sound_active.clear()
+        self.recording_active.clear()
+        self.interrupted.clear()
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self._ensure_tts_worker()
+
+    def safe_main_execution(self):
+        # Initialization errors should not permanently kill manual/wake input.
+        if not self.warmed_up:
+            try:
+                self.warm_up_logic()
+            except Exception as exc:
+                traceback.print_exc()
+                print(f"[INIT] Warmup failed but listener will continue: {exc}", flush=True)
+                self.set_state(BotStates.ERROR, "Warmup failed; continuing offline.")
+            self.warmed_up = True
+
+        self._ensure_tts_worker()
+
+        while not self.exiting:
+            try:
+                # Clear a previous cancellation before beginning the next cycle.
+                # A queued Enter/PTT event is deliberately preserved.
+                self.interrupted.clear()
+                self._touch_progress("waiting for wake")
                 trigger_source = self.detect_wake_word_or_ptt()
                 if self.exiting:
                     break
-                if self.interrupted.is_set():
-                    self.interrupted.clear()
-                    self.set_state(BotStates.IDLE, "Resetting...")
-                    continue
 
+                self._touch_progress(f"trigger={trigger_source}")
                 self.set_state(BotStates.LISTENING, "I'm listening!")
-                audio_file = self.record_voice_ptt() if trigger_source == "PTT" else self.record_voice_adaptive()
+                keyboard_mode = str(CURRENT_CONFIG.get("runtime", {}).get("keyboard_trigger_mode", "vad")).lower()
+                if trigger_source == "PTT" and keyboard_mode in {"toggle", "hold", "ptt"}:
+                    audio_file = self.record_voice_ptt()
+                else:
+                    # Wake word and the default one-press Enter trigger both use
+                    # silence-ending adaptive VAD.
+                    audio_file = self.record_voice_adaptive()
+
+                if self.interrupted.is_set():
+                    self._reset_after_cycle_error()
+                    self.set_state(BotStates.IDLE, "Interrupted; ready again.")
+                    continue
                 if not audio_file:
                     self.set_state(BotStates.IDLE, "Heard nothing.")
                     continue
 
+                self._touch_progress("transcribing")
                 user_text = self.transcribe_audio(audio_file)
                 if not user_text:
                     self.set_state(BotStates.IDLE, "Transcription empty.")
@@ -665,10 +801,20 @@ class BotGUI:
 
                 self.append_to_text(f"YOU: {user_text}")
                 self.interrupted.clear()
+                self._touch_progress("AI request")
                 self.chat_and_respond(user_text)
-        except Exception as exc:
-            traceback.print_exc()
-            self.set_state(BotStates.ERROR, f"Fatal Error: {str(exc)[:60]}")
+                self._touch_progress("cycle complete")
+
+            except Exception as exc:
+                # This used to sit outside the whole while-loop. One transient
+                # device/network exception therefore killed agent-main forever.
+                # Keep the process alive and return to wake/PTT instead.
+                traceback.print_exc()
+                print(f"[RECOVERY] Interaction failed: {exc}", flush=True)
+                self._reset_after_cycle_error()
+                self.set_state(BotStates.ERROR, f"Recovered from error: {str(exc)[:60]}")
+                time.sleep(0.35)
+                self.set_state(BotStates.IDLE, "Recovered - waiting for wake or Enter.")
 
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up local AI...")
@@ -685,7 +831,11 @@ class BotGUI:
     # ------------------------------------------------------------------
     def detect_wake_word_or_ptt(self) -> str:
         self.set_state(BotStates.IDLE, "Waiting...")
-        self.ptt_event.clear()
+        # Never clear here: Enter may have been pressed while the previous
+        # request was finishing. Preserve that queued manual wake.
+        if self.ptt_event.is_set():
+            self.ptt_event.clear()
+            return "PTT"
         if self.oww_model:
             self.oww_model.reset()
         if self.oww_model is None:
@@ -813,6 +963,11 @@ class BotGUI:
             nonlocal total_chunks, speech_chunks, speech_run, silent_chunks
             nonlocal speech_started, stop_reason, noise_floor, start_threshold, end_threshold
 
+            if self.interrupted.is_set():
+                stop_reason = "interrupted"
+                stop_event.set()
+                return
+
             chunk = indata.copy()
             level = rms_level(chunk)
             total_chunks += 1
@@ -822,7 +977,7 @@ class BotGUI:
                 if len(pre_roll) > pre_roll_limit:
                     del pre_roll[0]
 
-                # Learn the lower-energy room/microphone floor.  Median is much
+                # Learn the lower-energy room/microphone floor. Median is much
                 # less sensitive to a cough, click, or the tail of the wake word.
                 if len(noise_samples) < calibration_chunks:
                     noise_samples.append(level)
@@ -833,7 +988,7 @@ class BotGUI:
                     end_threshold = max(min_rms, noise_floor * end_noise_multiplier)
 
                 # Do not declare speech until the short noise calibration has
-                # completed.  Requiring consecutive chunks rejects clicks/noise.
+                # completed. Requiring consecutive chunks rejects clicks/noise.
                 if total_chunks >= calibration_chunks:
                     if level >= start_threshold:
                         speech_run += 1
@@ -885,10 +1040,14 @@ class BotGUI:
                 blocksize=chunk_size,
                 dtype="float32",
             ):
-                while not stop_event.is_set() and not self.exiting:
+                while not stop_event.is_set() and not self.exiting and not self.interrupted.is_set():
                     sd.sleep(25)
         except Exception as exc:
             print(f"[AUDIO] Adaptive recording failed: {exc}", flush=True)
+            return None
+
+        if self.interrupted.is_set():
+            print("[AUDIO] Recording interrupted.", flush=True)
             return None
 
         if not speech_started:
@@ -920,7 +1079,7 @@ class BotGUI:
             sd.stop()
             time.sleep(0.1)
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE):
-                while self.recording_active.is_set() and not self.exiting:
+                while self.recording_active.is_set() and not self.exiting and not self.interrupted.is_set():
                     sd.sleep(50)
         except Exception as exc:
             print(f"[AUDIO] PTT recording failed: {exc}", flush=True)
@@ -953,14 +1112,32 @@ class BotGUI:
             print("[STT] whisper.cpp is not installed. Run ./setup.sh.", flush=True)
             return ""
         try:
-            result = subprocess.run(
+            timeout = max(10.0, float(CURRENT_CONFIG.get("runtime", {}).get("stt_timeout_seconds", 60.0)))
+            proc = subprocess.Popen(
                 [executable, "-m", model, "-l", "en", "-t", "4", "-f", filename],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=120,
             )
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None:
+                if self.interrupted.is_set() or self.exiting:
+                    print("[STT] Transcription interrupted.", flush=True)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return ""
+                if time.monotonic() >= deadline:
+                    print(f"[STT] Timed out after {timeout:.1f}s.", flush=True)
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                    return ""
+                time.sleep(0.05)
+            stdout, _stderr = proc.communicate()
             segments = []
-            for line in result.stdout.splitlines():
+            for line in stdout.splitlines():
                 if "]" in line and "[" in line:
                     candidate = line.split("]", 1)[1].strip()
                     if candidate and candidate not in {"[BLANK_AUDIO]", "[ Silence ]"}:
@@ -1077,6 +1254,9 @@ class BotGUI:
                 if self.interrupted.is_set():
                     return
                 response = self.ai.chat(messages, tools=TOOL_SCHEMAS)
+                if self.interrupted.is_set():
+                    print("[AI] Response discarded because the request was interrupted.", flush=True)
+                    return
                 metrics = response.get("metrics") or {}
                 if metrics:
                     total_ns = metrics.get("total_duration")
@@ -1159,12 +1339,28 @@ class BotGUI:
             self.tts_queue.append(clean)
 
     def wait_for_tts(self):
+        timeout = max(5.0, float(CURRENT_CONFIG.get("runtime", {}).get("tts_timeout_seconds", 35.0)))
+        deadline = time.monotonic() + timeout
         while not self.exiting:
             with self.tts_queue_lock:
                 queue_empty = not self.tts_queue
             if queue_empty and not self.tts_active.is_set():
                 return
             if self.interrupted.is_set():
+                return
+            if time.monotonic() >= deadline:
+                print(f"[TTS] Timed out after {timeout:.1f}s; recovering audio worker.", flush=True)
+                with self.tts_queue_lock:
+                    self.tts_queue.clear()
+                if self.current_audio_process:
+                    try:
+                        self.current_audio_process.terminate()
+                    except Exception:
+                        pass
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
                 return
             time.sleep(0.05)
 
@@ -1194,6 +1390,7 @@ class BotGUI:
         source_rate = piper_sample_rate(voice_model)
         print(f"[TTS] {clean!r}", flush=True)
 
+        kill_timer = None
         try:
             self.current_audio_process = subprocess.Popen(
                 ["./piper/piper", "--model", voice_model, "--output-raw"],
@@ -1201,6 +1398,21 @@ class BotGUI:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+            active_process = self.current_audio_process
+            piper_timeout = max(5.0, float(CURRENT_CONFIG.get("runtime", {}).get("piper_process_timeout_seconds", 30.0)))
+
+            def _kill_stuck_piper():
+                if active_process.poll() is None:
+                    print(f"[TTS] Piper exceeded {piper_timeout:.1f}s; terminating it.", flush=True)
+                    try:
+                        active_process.terminate()
+                    except Exception:
+                        pass
+
+            kill_timer = threading.Timer(piper_timeout, _kill_stuck_piper)
+            kill_timer.daemon = True
+            kill_timer.start()
+
             self.current_audio_process.stdin.write(clean.encode("utf-8") + b"\n")
             self.current_audio_process.stdin.close()
 
@@ -1246,6 +1458,8 @@ class BotGUI:
         except Exception as exc:
             print(f"[TTS] Audio error: {exc}", flush=True)
         finally:
+            if kill_timer is not None:
+                kill_timer.cancel()
             self.current_volume = 0
             if self.current_audio_process:
                 try:
