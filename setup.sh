@@ -278,12 +278,12 @@ if command_exists ollama; then
     ollama pull qwen3.5:2b || warn "Could not pull qwen3.5:2b. You can retry later with: ollama pull qwen3.5:2b"
 fi
 
-if [[ ! -f wakeword.onnx ]]; then
-    curl -fL -o wakeword.onnx \
-        https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx || warn "Wake-word model download failed."
+chmod +x install_wake_words.sh 2>/dev/null || true
+if ! bash install_wake_words.sh; then
+    warn "Wake-word installation was incomplete. You can retry later with: ./install_wake_words.sh"
 fi
 
-chmod +x start_agent.sh setup_jetson_thor.sh hardware_check.py 2>/dev/null || true
+chmod +x start_agent.sh setup_jetson_thor.sh hardware_check.py install_wake_words.sh 2>/dev/null || true
 
 echo
 ok "Setup reached the end successfully."

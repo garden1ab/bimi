@@ -150,20 +150,47 @@ def check_camera() -> bool:
     return ok
 
 
-def check_ollama(name: str, base_url: str) -> bool:
+def check_ollama(name: str, base_url: str, model: str = "") -> bool:
     print(f"\n[{name} AI] {base_url}")
     if not base_url:
         print("No base_url configured")
         return False
-    url = base_url.rstrip("/") + "/api/tags"
+    tags_url = base_url.rstrip("/") + "/api/tags"
     try:
-        with urllib.request.urlopen(url, timeout=4) as response:
+        with urllib.request.urlopen(tags_url, timeout=4) as response:
             payload = json.loads(response.read().decode("utf-8"))
         models = [m.get("name") or m.get("model") for m in payload.get("models", [])]
         print("Models:", ", ".join(x for x in models if x) or "none")
-        return True
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         print(f"Unavailable: {exc}")
+        return False
+
+    if not model:
+        return True
+
+    # Exercise the same keep_alive type used by the agent. This catches the
+    # historical JSON string "-1" error before the GUI is started.
+    generate_url = base_url.rstrip("/") + "/api/generate"
+    body = json.dumps({
+        "model": model,
+        "prompt": "",
+        "stream": False,
+        "keep_alive": -1,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        generate_url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+        print(f"Inference API OK: {model} (numeric keep_alive=-1)")
+        return True
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"Inference API failed: HTTP {exc.code}: {detail}")
+        return False
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        print(f"Inference API failed: {exc}")
         return False
 
 
@@ -202,7 +229,9 @@ def main() -> int:
     for name in ("local", "thor"):
         backend = backends.get(name, {})
         if backend.get("type", "ollama") == "ollama":
-            results[f"ai_{name}"] = check_ollama(name.upper(), backend.get("base_url", ""))
+            results[f"ai_{name}"] = check_ollama(
+                name.upper(), backend.get("base_url", ""), backend.get("text_model", "")
+            )
 
     print("\n[Summary]")
     for key, value in results.items():

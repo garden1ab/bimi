@@ -40,6 +40,26 @@ def _as_dict(value: Any) -> Dict[str, Any]:
         return {}
 
 
+
+
+def _normalize_keep_alive(value: Any) -> Any:
+    """Normalize Ollama keep_alive values across config/API versions.
+
+    Ollama accepts numeric seconds (including negative numbers to keep a model
+    resident) or duration strings such as ``5m``/``-1m``. A JSON string of
+    ``"-1"`` is interpreted as a Go duration and fails because it has no unit.
+    Older Be More configs used that exact string, so convert integer-looking
+    strings to integers before sending them to Ollama.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"[+-]?\d+", stripped):
+            try:
+                return int(stripped)
+            except ValueError:
+                return value
+    return value
+
 def _normalize_spoken_model_name(value: str) -> str:
     value = value.lower().strip()
     replacements = {
@@ -316,7 +336,7 @@ class AIBackendManager:
         }
         if tools:
             kwargs["tools"] = tools
-        keep_alive = self.backend_config(backend).get("keep_alive", "-1")
+        keep_alive = _normalize_keep_alive(self.backend_config(backend).get("keep_alive", -1))
         if keep_alive is not None:
             kwargs["keep_alive"] = keep_alive
 

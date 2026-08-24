@@ -14,7 +14,7 @@ sudo mkdir -p /etc/systemd/system/ollama.service.d
 sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<'EOF'
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_KEEP_ALIVE=-1"
+Environment="OLLAMA_KEEP_ALIVE=-1m"
 EOF
 
 sudo systemctl daemon-reload

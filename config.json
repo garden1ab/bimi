@@ -28,7 +28,7 @@
           "pi",
           "raspberry pi"
         ],
-        "keep_alive": "-1"
+        "keep_alive": -1
       },
       "thor": {
         "type": "ollama",
@@ -50,7 +50,7 @@
           "jetson",
           "jetson thor"
         ],
-        "keep_alive": "-1"
+        "keep_alive": -1
       }
     }
   },
@@ -88,5 +88,24 @@
     "hailo_threshold": 0.45,
     "max_detections": 12,
     "labels_path": "assets/coco.txt"
+  },
+  "wake_word": {
+    "enabled": true,
+    "threshold": 0.5,
+    "models": [
+      {
+        "phrase": "Hey BMO",
+        "path": "wakewords/hey_bmo.onnx"
+      },
+      {
+        "phrase": "Hey Jarvis",
+        "model": "hey_jarvis"
+      },
+      {
+        "phrase": "Hey Mycroft",
+        "model": "hey_mycroft"
+      }
+    ],
+    "legacy_model": "wakeword.onnx"
   }
 }

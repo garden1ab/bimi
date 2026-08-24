@@ -51,8 +51,6 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 CONFIG_FILE = "config.json"
 MEMORY_FILE = "memory.json"
-WAKE_WORD_MODEL = "./wakeword.onnx"
-WAKE_WORD_THRESHOLD = 0.5
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "voice_model": "piper/en_GB-semaine-medium.onnx",
@@ -61,6 +59,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "input_device": "USB",
     "input_sample_rate": None,
     "output_device": "MAX98357A",
+    "wake_word": {
+        "enabled": True,
+        "threshold": 0.5,
+        "models": [
+            {"phrase": "Hey BMO", "path": "wakewords/hey_bmo.onnx"},
+            {"phrase": "Hey Jarvis", "model": "hey_jarvis"},
+            {"phrase": "Hey Mycroft", "model": "hey_mycroft"}
+        ],
+        "legacy_model": "wakeword.onnx"
+    },
     "ai": {
         "default_backend": "local",
         "fallback_to_local": True,
@@ -73,7 +81,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "text_models": ["qwen3.5:0.8b", "qwen3.5:2b", "qwen3:1.7b"],
                 "vision_models": ["qwen3.5:0.8b", "qwen3.5:2b"],
                 "aliases": ["local", "pi", "raspberry pi"],
-                "keep_alive": "-1",
+                "keep_alive": -1,
             },
             "thor": {
                 "type": "ollama",
@@ -83,7 +91,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "text_models": ["qwen3.5:9b", "qwen3.5:27b", "qwen3.5:35b"],
                 "vision_models": ["qwen3.5:9b", "qwen3.5:27b"],
                 "aliases": ["thor", "server", "jetson", "jetson thor"],
-                "keep_alive": "-1",
+                "keep_alive": -1,
             },
         },
     },
@@ -352,19 +360,75 @@ class BotGUI:
         self.vision = CameraVision(CURRENT_CONFIG.get("camera", {}))
         self.motion.start()
 
-        print("[INIT] Loading wake word...", flush=True)
+        print("[INIT] Loading wake words...", flush=True)
         self.oww_model = None
-        if os.path.exists(WAKE_WORD_MODEL):
-            try:
+        self.wake_word_threshold = 0.5
+        self.wake_word_phrases: List[str] = []
+        self.wake_word_labels: Dict[str, str] = {}
+        wake_cfg = CURRENT_CONFIG.get("wake_word", {})
+        if wake_cfg.get("enabled", True):
+            self.wake_word_threshold = float(wake_cfg.get("threshold", 0.5))
+            wake_models: List[str] = []
+            for entry in wake_cfg.get("models", []):
+                if not isinstance(entry, dict):
+                    continue
+                phrase = str(entry.get("phrase", "Wake word")).strip()
+                path = str(entry.get("path", "")).strip()
+                model_name = str(entry.get("model", "")).strip()
+                if path:
+                    if os.path.exists(path):
+                        wake_models.append(path)
+                        self.wake_word_phrases.append(phrase)
+                        self.wake_word_labels[Path(path).stem] = phrase
+                    else:
+                        print(f"[WAKE] Optional model missing for {phrase}: {path}", flush=True)
+                elif model_name:
+                    # Resolve official model names to their downloaded ONNX path.
+                    # This avoids API/version differences around passing model names directly.
+                    model_meta = getattr(openwakeword, "MODELS", {}).get(model_name, {})
+                    model_path = str(model_meta.get("model_path", ""))
+                    if model_path.endswith(".tflite"):
+                        model_path = model_path[:-7] + ".onnx"
+                    if model_path and os.path.exists(model_path):
+                        wake_models.append(model_path)
+                        self.wake_word_phrases.append(phrase)
+                        self.wake_word_labels[Path(model_path).stem] = phrase
+                    else:
+                        print(
+                            f"[WAKE] Built-in model missing for {phrase} ({model_name}). "
+                            "Run ./install_wake_words.sh.",
+                            flush=True,
+                        )
+
+            # Preserve compatibility with the original single wakeword.onnx.
+            # It is only used if none of the explicitly configured models can be used.
+            if not wake_models:
+                legacy_model = str(wake_cfg.get("legacy_model", "wakeword.onnx")).strip()
+                if legacy_model and os.path.exists(legacy_model):
+                    wake_models = [legacy_model]
+                    self.wake_word_phrases = ["Hey Jarvis (legacy/default)"]
+                    self.wake_word_labels[Path(legacy_model).stem] = "Hey Jarvis"
+
+            if wake_models:
                 try:
-                    self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
-                except TypeError:
-                    self.oww_model = Model(wakeword_models=[WAKE_WORD_MODEL])
-                print("[INIT] Wake word loaded.", flush=True)
-            except Exception as exc:
-                print(f"[WAKE] Could not load model: {exc}", flush=True)
+                    try:
+                        self.oww_model = Model(
+                            wakeword_models=wake_models,
+                            inference_framework="onnx",
+                        )
+                    except TypeError:
+                        # Compatibility with older openWakeWord releases.
+                        self.oww_model = Model(wakeword_model_paths=wake_models)
+                    print(
+                        "[INIT] Wake words loaded: " + ", ".join(self.wake_word_phrases),
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[WAKE] Could not load wake-word models: {exc}", flush=True)
+            else:
+                print("[WAKE] No wake-word models are available; PTT only.", flush=True)
         else:
-            print(f"[WAKE] Model not found: {WAKE_WORD_MODEL}; PTT only.", flush=True)
+            print("[WAKE] Wake-word detection disabled in config.json; PTT only.", flush=True)
 
         self.background_label = tk.Label(master)
         self.background_label.place(x=0, y=0, width=self.BG_WIDTH, height=self.BG_HEIGHT)
@@ -643,8 +707,9 @@ class BotGUI:
                         if not scores:
                             continue
                         score = float(list(scores)[-1])
-                        if score > WAKE_WORD_THRESHOLD:
-                            print(f"[WAKE] {model_name}: {score:.2f}", flush=True)
+                        if score > self.wake_word_threshold:
+                            phrase = self.wake_word_labels.get(model_name, model_name)
+                            print(f"[WAKE] {phrase}: {score:.2f}", flush=True)
                             self.oww_model.reset()
                             return "WAKE"
         except Exception as exc:

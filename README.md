@@ -72,6 +72,18 @@ A reboot is required after those boot settings are added.
 
 The application selects the first capture device containing `USB` in its PortAudio/ALSA name. Set this to a more specific name or numeric device index if you have multiple USB audio devices.
 
+## Wake words
+
+Wake-word detection runs locally with openWakeWord. This build listens for:
+
+- **Hey BMO** — community-trained `hey_beemo.onnx` classifier downloaded by `setup.sh`.
+- **Hey Jarvis** — official openWakeWord pretrained model.
+- **Hey Mycroft** — official openWakeWord pretrained model.
+
+Pressing **Enter** remains available as push-to-talk even when wake-word loading fails. The wake-word threshold and enabled models are configured under `wake_word` in `config.json`. The default threshold is `0.5`.
+
+The original `wakeword.onnx` file is retained as a backwards-compatible fallback and corresponds to the upstream project's default **Hey Jarvis** wake word.
+
 ---
 
 ## AI architecture
@@ -310,3 +322,7 @@ be-more-agent/
 ## License
 
 The original software is MIT licensed. This modification retains that software basis and does not change the original project's third-party asset/license obligations.
+
+### Ollama error: `time: missing unit in duration "-1"`
+
+Older versions of this project stored `keep_alive` as the JSON string `"-1"`. Current Ollama accepts a numeric negative value such as `-1`, or a duration string with units such as `"-1m"`. This build normalizes legacy numeric strings automatically, and the shipped `config.json` uses numeric `-1`.
