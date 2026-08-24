@@ -82,6 +82,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "end_noise_multiplier": 1.7,
         "speech_start_chunks": 2
     },
+    "memory": {
+        "local_context_messages": 6,
+        "thor_context_messages": 16,
+        "saved_messages": 16
+    },
+    "thinking_audio": {
+        "enabled": True,
+        "delay_seconds": 0.25,
+        "announce_once": True
+    },
     "ai": {
         "default_backend": "local",
         "fallback_to_local": True,
@@ -95,6 +105,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "vision_models": ["qwen3.5:0.8b", "qwen3.5:2b"],
                 "aliases": ["local", "pi", "raspberry pi"],
                 "keep_alive": -1,
+                "think": False,
+                "options": {
+                    "num_ctx": 2048,
+                    "num_predict": 96,
+                    "temperature": 0.4
+                },
             },
             "thor": {
                 "type": "ollama",
@@ -105,6 +121,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "vision_models": ["qwen3.5:9b", "qwen3.5:27b"],
                 "aliases": ["thor", "server", "jetson", "jetson thor"],
                 "keep_alive": -1,
+                "think": False,
+                "options": {
+                    "num_ctx": 8192,
+                    "num_predict": 256,
+                    "temperature": 0.5
+                },
             },
         },
     },
@@ -147,11 +169,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 OLLAMA_OPTIONS = {
     "num_thread": 4,
-    "temperature": 0.6,
+    "temperature": 0.5,
     "top_k": 20,
     "top_p": 0.9,
-    # Keep the Pi responsive. The application only needs a modest context window.
-    "num_ctx": 8192,
+    # Backend-specific options in config.json override these defaults.
+    "num_ctx": 4096,
+    "num_predict": 160,
 }
 
 BASE_SYSTEM_PROMPT = """You are the conversational AI inside a small Raspberry Pi 5 robot.
@@ -1028,8 +1051,19 @@ class BotGUI:
                 "content": f"LIVE ROBOT STATE: {sensor_context}\nAI ROUTING STATE: {backend_context}",
             },
         ]
-        messages.extend(self.history)
-        messages.extend(self.session_memory)
+        # Keep the local prompt small. Re-evaluating a long conversation on the
+        # Pi CPU adds substantial first-token latency. Thor retains a larger window.
+        memory_cfg = CURRENT_CONFIG.get("memory", {})
+        if self.ai.current_backend == "local":
+            max_context_messages = int(memory_cfg.get("local_context_messages", 6))
+        else:
+            max_context_messages = int(memory_cfg.get("thor_context_messages", 16))
+        conversation_memory = self.history + self.session_memory
+        if max_context_messages > 0:
+            conversation_memory = conversation_memory[-max_context_messages:]
+        else:
+            conversation_memory = []
+        messages.extend(conversation_memory)
         messages.append({"role": "user", "content": text})
         self.session_memory.append({"role": "user", "content": text})
 
@@ -1043,6 +1077,22 @@ class BotGUI:
                 if self.interrupted.is_set():
                     return
                 response = self.ai.chat(messages, tools=TOOL_SCHEMAS)
+                metrics = response.get("metrics") or {}
+                if metrics:
+                    total_ns = metrics.get("total_duration")
+                    eval_count = metrics.get("eval_count")
+                    eval_ns = metrics.get("eval_duration")
+                    total_s = (float(total_ns) / 1e9) if total_ns else None
+                    tok_s = (float(eval_count) / (float(eval_ns) / 1e9)) if eval_count and eval_ns else None
+                    parts = []
+                    if total_s is not None:
+                        parts.append(f"total={total_s:.2f}s")
+                    if tok_s is not None:
+                        parts.append(f"generation={tok_s:.1f} tok/s")
+                    if metrics.get("prompt_eval_count") is not None:
+                        parts.append(f"prompt={metrics.get('prompt_eval_count')} tok")
+                    if parts:
+                        print("[AI PERF] " + ", ".join(parts), flush=True)
                 tool_calls = response.get("tool_calls") or []
                 content = str(response.get("content", "")).strip()
                 if not tool_calls:
@@ -1208,15 +1258,19 @@ class BotGUI:
                 self.current_audio_process = None
 
     def _run_thinking_sound_loop(self):
-        time.sleep(0.4)
-        while self.thinking_sound_active.is_set() and not self.exiting:
-            sound = self.get_random_sound(thinking_sounds_dir)
-            if sound:
-                self.play_sound(sound)
-            for _ in range(40):
-                if not self.thinking_sound_active.is_set() or self.exiting:
-                    return
-                time.sleep(0.1)
+        """Play at most one thinking acknowledgement for each user request."""
+        cfg = CURRENT_CONFIG.get("thinking_audio", {})
+        if not cfg.get("enabled", True):
+            return
+        delay = max(0.0, float(cfg.get("delay_seconds", 0.25)))
+        time.sleep(delay)
+        if not self.thinking_sound_active.is_set() or self.exiting:
+            return
+        sound = self.get_random_sound(thinking_sounds_dir)
+        if sound:
+            self.play_sound(sound)
+        # Deliberately do not loop. The event remains useful for cancellation,
+        # but a slow backend no longer repeats "thinking" announcements.
 
     @staticmethod
     def get_random_sound(directory: str) -> Optional[str]:
@@ -1272,7 +1326,8 @@ class BotGUI:
     def save_chat_history(self):
         if not CURRENT_CONFIG.get("chat_memory", True):
             return
-        combined = (self.history + self.session_memory)[-16:]
+        saved_messages = max(0, int(CURRENT_CONFIG.get("memory", {}).get("saved_messages", 16)))
+        combined = (self.history + self.session_memory)[-saved_messages:] if saved_messages else []
         try:
             with open(MEMORY_FILE, "w", encoding="utf-8") as handle:
                 json.dump(combined, handle, indent=2, ensure_ascii=False)

@@ -28,7 +28,13 @@
           "pi",
           "raspberry pi"
         ],
-        "keep_alive": -1
+        "keep_alive": -1,
+        "think": false,
+        "options": {
+          "num_ctx": 2048,
+          "num_predict": 96,
+          "temperature": 0.4
+        }
       },
       "thor": {
         "type": "ollama",
@@ -50,7 +56,13 @@
           "jetson",
           "jetson thor"
         ],
-        "keep_alive": -1
+        "keep_alive": -1,
+        "think": false,
+        "options": {
+          "num_ctx": 8192,
+          "num_predict": 256,
+          "temperature": 0.5
+        }
       }
     }
   },
@@ -120,5 +132,15 @@
     "noise_multiplier": 2.4,
     "end_noise_multiplier": 1.7,
     "speech_start_chunks": 2
+  },
+  "memory": {
+    "local_context_messages": 6,
+    "thor_context_messages": 16,
+    "saved_messages": 16
+  },
+  "thinking_audio": {
+    "enabled": true,
+    "delay_seconds": 0.25,
+    "announce_once": true
   }
 }

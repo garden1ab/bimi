@@ -328,22 +328,48 @@ class AIBackendManager:
                     message["images"] = [image_path]
                     break
 
+        cfg = self.backend_config(backend)
+        options = copy.deepcopy(self.options)
+        backend_options = cfg.get("options", {})
+        if isinstance(backend_options, dict):
+            options.update(backend_options)
+
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": payload_messages,
             "stream": False,
-            "options": self.options,
+            "options": options,
+            # Qwen thinking models spend substantial CPU time generating an
+            # internal reasoning trace. A voice assistant should optimize for
+            # response latency; reasoning can be re-enabled per backend in config.
+            "think": cfg.get("think", False),
         }
         if tools:
             kwargs["tools"] = tools
-        keep_alive = _normalize_keep_alive(self.backend_config(backend).get("keep_alive", -1))
+        keep_alive = _normalize_keep_alive(cfg.get("keep_alive", -1))
         if keep_alive is not None:
             kwargs["keep_alive"] = keep_alive
 
         response = client.chat(**kwargs)
         response_dict = _as_dict(response)
         message = _as_dict(response_dict.get("message", getattr(response, "message", None)))
-        return self._normalize_message(message)
+        normalized = self._normalize_message(message)
+
+        # Keep lightweight timing data so the host can distinguish model load,
+        # prompt evaluation, and token generation delays on constrained hardware.
+        normalized["metrics"] = {
+            key: response_dict.get(key)
+            for key in (
+                "total_duration",
+                "load_duration",
+                "prompt_eval_count",
+                "prompt_eval_duration",
+                "eval_count",
+                "eval_duration",
+            )
+            if response_dict.get(key) is not None
+        }
+        return normalized
 
     def _chat_openai_compatible(
         self,
