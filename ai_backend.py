@@ -114,14 +114,92 @@ class AIBackendManager:
         key = "vision_model" if vision else "text_model"
         cfg[key] = model
 
-    def switch_backend(self, name_or_alias: str) -> str:
+    def switch_backend(self, name_or_alias: str, *, verify: bool = True) -> str:
+        """Switch backend only after the target is actually reachable.
+
+        The previous implementation changed ``current_backend`` before proving
+        that Thor could serve the configured model.  Because normal inference
+        then silently fell back to local, the UI could say "thor" while the
+        Raspberry Pi was doing the work.
+        """
         normalized = name_or_alias.lower().strip()
+        target = None
         for name, cfg in self.backends.items():
             aliases = [name] + list(cfg.get("aliases", []))
             if any(normalized == str(alias).lower().strip() for alias in aliases):
-                self.current_backend = name
-                return name
-        raise AIBackendError(f"Unknown AI backend: {name_or_alias}")
+                target = name
+                break
+        if target is None:
+            raise AIBackendError(f"Unknown AI backend: {name_or_alias}")
+
+        previous = self.current_backend
+        if verify:
+            health = self.probe_backend(target, require_model=True)
+            if not health.get("ok"):
+                self.current_backend = previous
+                raise AIBackendError(str(health.get("error") or f"{target} is unavailable"))
+
+        self.current_backend = target
+        return target
+
+    def probe_backend(self, backend: Optional[str] = None, *, require_model: bool = True) -> Dict[str, Any]:
+        """Verify endpoint reachability and, for Ollama, the configured model."""
+        name = backend or self.current_backend
+        cfg = self.backend_config(name)
+        backend_type = str(cfg.get("type", "ollama")).lower()
+        model = self.get_model(backend=name)
+        try:
+            if backend_type == "ollama":
+                response = self._get_ollama_client(name).list()
+                data = _as_dict(response)
+                installed = []
+                for item in data.get("models", []):
+                    d = _as_dict(item)
+                    model_name = d.get("model") or d.get("name")
+                    if model_name:
+                        installed.append(str(model_name))
+                if require_model and model and model not in installed:
+                    return {
+                        "ok": False,
+                        "backend": name,
+                        "base_url": cfg.get("base_url"),
+                        "model": model,
+                        "models": installed,
+                        "error": f"{name} is reachable but model {model} is not installed there",
+                    }
+                return {
+                    "ok": True,
+                    "backend": name,
+                    "base_url": cfg.get("base_url"),
+                    "model": model,
+                    "models": installed,
+                }
+
+            if backend_type in {"openai", "openai_compatible", "vllm"}:
+                base_url = cfg.get("base_url") or cfg.get("text_base_url")
+                if not base_url:
+                    return {"ok": False, "error": f"No base_url configured for {name}"}
+                endpoint = str(base_url).rstrip("/") + "/models"
+                response = requests.get(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {cfg.get('api_key', 'not-needed')}"},
+                    timeout=max(2.0, float(cfg.get("connect_timeout_seconds", 4.0))),
+                )
+                response.raise_for_status()
+                installed = [str(x.get("id")) for x in response.json().get("data", []) if x.get("id")]
+                if require_model and model and installed and model not in installed:
+                    return {"ok": False, "error": f"{name} is reachable but model {model} is not served there"}
+                return {"ok": True, "backend": name, "base_url": base_url, "model": model, "models": installed}
+
+            return {"ok": False, "error": f"Unsupported backend type {backend_type!r}"}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "backend": name,
+                "base_url": cfg.get("base_url"),
+                "model": model,
+                "error": f"cannot reach {name} at {cfg.get('base_url')}: {exc}",
+            }
 
     def status_text(self) -> str:
         cfg = self.backend_config()
@@ -150,14 +228,18 @@ class AIBackendManager:
         if not imperative:
             return None
 
-        # Backend switch first.
+        # Backend switch first.  Do not confirm until the target endpoint and
+        # configured model are actually reachable.
         for name, cfg in self.backends.items():
             aliases = [name] + list(cfg.get("aliases", []))
             for alias in sorted(aliases, key=lambda x: len(str(x)), reverse=True):
                 alias_l = str(alias).lower().strip()
                 if re.search(rf"\b{re.escape(alias_l)}\b", lower):
-                    self.current_backend = name
-                    return self.status_text()
+                    try:
+                        self.switch_backend(name, verify=True)
+                        return self.status_text()
+                    except AIBackendError as exc:
+                        return f"I could not switch to {name}. {exc}. I am still using {self.current_backend}."
 
         # Model switch on the current backend.
         cfg = self.backend_config()
@@ -244,8 +326,14 @@ class AIBackendManager:
         allow_fallback: bool = True,
     ) -> Dict[str, Any]:
         target = backend or self.current_backend
+        model = self.get_model(vision=vision, backend=target)
         try:
-            return self._chat_backend(target, messages, tools=tools, vision=vision, image_path=image_path)
+            response = self._chat_backend(target, messages, tools=tools, vision=vision, image_path=image_path)
+            response["requested_backend"] = target
+            response["actual_backend"] = target
+            response["fallback_used"] = False
+            response["model"] = model
+            return response
         except Exception as exc:
             if (
                 allow_fallback
@@ -253,8 +341,19 @@ class AIBackendManager:
                 and target != "local"
                 and "local" in self.backends
             ):
-                print(f"[AI] {target} failed ({exc}); falling back to local.", flush=True)
-                return self._chat_backend("local", messages, tools=tools, vision=vision, image_path=image_path)
+                print(f"[AI] {target} failed ({exc}); falling back to local and changing active state.", flush=True)
+                local_model = self.get_model(vision=vision, backend="local")
+                response = self._chat_backend("local", messages, tools=tools, vision=vision, image_path=image_path)
+                # Keep the UI/status truthful after a remote failure.  The user
+                # can explicitly switch back to Thor once its health check passes.
+                self.current_backend = "local"
+                response["requested_backend"] = target
+                response["actual_backend"] = "local"
+                response["fallback_used"] = True
+                response["fallback_from"] = target
+                response["fallback_reason"] = str(exc)
+                response["model"] = local_model
+                return response
             if isinstance(exc, AIBackendError):
                 raise
             raise AIBackendError(str(exc)) from exc

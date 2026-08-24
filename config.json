@@ -86,7 +86,9 @@
       "gyro_threshold_dps": 18.0,
       "motion_hold_seconds": 2.5,
       "interrupt_threshold_mg": 80,
-      "interrupt_duration_ms": 20
+      "interrupt_duration_ms": 20,
+      "rest_calibration_samples": 30,
+      "rest_calibration_interval_seconds": 0.02
     },
     "max98357a": {
       "enabled": true,

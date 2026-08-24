@@ -115,10 +115,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "thor": {
                 "type": "ollama",
                 "base_url": "http://jetson-thor.local:11434",
-                "text_model": "qwen3.5:27b",
-                "vision_model": "qwen3.5:27b",
-                "text_models": ["qwen3.5:9b", "qwen3.5:27b", "qwen3.5:35b"],
-                "vision_models": ["qwen3.5:9b", "qwen3.5:27b"],
+                "text_model": "qwen3.6:35b",
+                "vision_model": "qwen3.6:35b",
+                "text_models": ["qwen3.6:35b", "qwen3.6:35b-a3b-nvfp4", "qwen3.8:27b", "qwen3.5:35b"],
+                "vision_models": ["qwen3.6:35b", "qwen3.6:35b-a3b-nvfp4", "qwen3.8:27b"],
                 "aliases": ["thor", "server", "jetson", "jetson thor"],
                 "keep_alive": -1,
                 "think": False,
@@ -183,6 +183,9 @@ Be concise, useful, and natural. You have live tools for the clock, web search, 
 Rules:
 - Use look_at_camera whenever the user asks what you see, asks about the surroundings, or asks a question that requires visual inspection. Never guess what the camera sees.
 - Use get_motion_state when a question depends on whether the robot is moving or was moved.
+- Use get_orientation whenever the user asks for angle, tilt, orientation, level, pose, or position relative to rest. Do not estimate these from words; use the live MPU-6050 reading.
+- If the user asks to make the current physical pose the new zero/rest pose, use set_rest_orientation.
+- The MPU-6050 can determine gravity-referenced roll/pitch and total tilt, but it cannot provide reliable absolute yaw without a magnetometer.
 - Use get_time for the current local time.
 - Use search_web only when fresh public information is needed.
 - A live sensor-state system message is included on every turn. Treat it as current physical state.
@@ -232,7 +235,23 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_motion_state",
-            "description": "Read whether the robot is moving or was recently moved, including accelerometer/gyro values.",
+            "description": "Read whether the robot is moving or was recently moved, including accelerometer/gyro values and rest-relative tilt.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_orientation",
+            "description": "Get a fresh MPU-6050 orientation reading: roll, pitch, and total tilt in degrees relative to the calibrated rest pose. Yaw is unavailable without a magnetometer.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_rest_orientation",
+            "description": "Calibrate the robot's current stationary pose as zero/rest orientation for future roll, pitch, and tilt measurements.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -1161,6 +1180,20 @@ class BotGUI:
         if name == "get_motion_state":
             return self.motion.context_for_llm()
 
+        if name == "get_orientation":
+            return self.motion.orientation_context_for_llm()
+
+        if name == "set_rest_orientation":
+            result = self.motion.calibrate_rest()
+            if result.get("ok"):
+                return (
+                    "Rest orientation recalibrated successfully. "
+                    f"Baseline roll={result.get('rest_roll_deg')} degrees and "
+                    f"pitch={result.get('rest_pitch_deg')} degrees. "
+                    "Future roll/pitch/tilt readings are relative to this pose."
+                )
+            return f"Could not calibrate the MPU-6050 rest orientation: {result.get('error', 'unknown error')}"
+
         if name == "search_web":
             query = str(arguments.get("query") or user_text).strip()
             if not query:
@@ -1212,6 +1245,20 @@ class BotGUI:
             self.respond_plain("Okay. Conversation memory cleared.")
             return
 
+        # Physical calibration commands should not depend on the LLM choosing a tool.
+        # The user must keep the robot stationary while this short calibration runs.
+        if re.search(r"\b(?:set|make|calibrate)\b.*\b(?:rest|zero|home)\b", lower) or re.search(
+            r"\b(?:set|make) (?:this|current) (?:position|pose|orientation) (?:as|the) (?:rest|zero)\b", lower
+        ):
+            result = self.motion.calibrate_rest()
+            if result.get("ok"):
+                self.respond_plain(
+                    f"Rest position calibrated. Roll and pitch are now zeroed to this pose."
+                )
+            else:
+                self.respond_plain(f"I could not calibrate the accelerometer: {result.get('error', 'unknown error')}")
+            return
+
         # Speech-level routing is handled before asking the LLM so even a small
         # local model cannot accidentally ignore a backend switch command.
         switch_reply = self.ai.parse_speech_command(text)
@@ -1228,6 +1275,13 @@ class BotGUI:
                 "content": f"LIVE ROBOT STATE: {sensor_context}\nAI ROUTING STATE: {backend_context}",
             },
         ]
+        # Angle/orientation questions always receive a fresh dedicated sensor read,
+        # even if the model chooses not to emit a function call.
+        if re.search(r"\b(angle|tilt|orientation|level|lean|roll|pitch|accelerometer|gyro|gyroscope|moved|moving)\b", lower):
+            messages.append({
+                "role": "system",
+                "content": "FRESH MPU-6050 READ: " + self.motion.orientation_context_for_llm(),
+            })
         # Keep the local prompt small. Re-evaluating a long conversation on the
         # Pi CPU adds substantial first-token latency. Thor retains a larger window.
         memory_cfg = CURRENT_CONFIG.get("memory", {})
@@ -1249,11 +1303,21 @@ class BotGUI:
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
 
         final_text = ""
+        fallback_notice = ""
         try:
             for _ in range(5):
                 if self.interrupted.is_set():
                     return
                 response = self.ai.chat(messages, tools=TOOL_SCHEMAS)
+                actual_backend = response.get("actual_backend", self.ai.current_backend)
+                print(
+                    f"[AI ROUTE] requested={response.get('requested_backend', actual_backend)} "
+                    f"actual={actual_backend} model={response.get('model', self.ai.get_model())}",
+                    flush=True,
+                )
+                if response.get("fallback_used"):
+                    fallback_from = response.get("fallback_from", "remote backend")
+                    fallback_notice = f"{fallback_from} became unavailable, so I switched back to local. "
                 if self.interrupted.is_set():
                     print("[AI] Response discarded because the request was interrupted.", flush=True)
                     return
@@ -1303,6 +1367,8 @@ class BotGUI:
                     messages.append(tool_message)
             if not final_text:
                 final_text = "I could not complete that request with the available tools."
+            if fallback_notice and not final_text.startswith(fallback_notice):
+                final_text = fallback_notice + final_text
 
             self.thinking_sound_active.clear()
             self.session_memory.append({"role": "assistant", "content": final_text})

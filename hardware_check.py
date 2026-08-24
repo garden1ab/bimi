@@ -1,247 +1,110 @@
 #!/usr/bin/env python3
-"""Target diagnostics for Raspberry Pi 5 + AI HAT+ + GY-521 + audio.
-
-This file intentionally uses the Python standard library for its top-level
-checks so it can still explain a broken/missing project venv.
-"""
-
-from __future__ import annotations
+"""Quick target-hardware diagnostics for the modified Be More Agent."""
 
 import json
 import os
 import platform
-import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+import requests
 
 
-def command(name: str) -> str | None:
-    return shutil.which(name)
-
-
-def run(label: str, argv: list[str], timeout: int = 15) -> tuple[bool, str]:
-    print(f"\n[{label}] {' '.join(argv)}")
-    if command(argv[0]) is None:
-        msg = f"MISSING COMMAND: {argv[0]}"
-        print(msg)
-        return False, msg
+def run(label, command):
+    print(f"\n[{label}] {' '.join(command)}")
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
         output = (result.stdout + result.stderr).strip()
         print(output if output else f"exit={result.returncode}")
-        return result.returncode == 0, output
+        return result.returncode == 0
     except Exception as exc:
         print(f"ERROR: {exc}")
-        return False, str(exc)
-
-
-def os_info() -> dict[str, str]:
-    data: dict[str, str] = {}
-    path = Path("/etc/os-release")
-    if path.exists():
-        for line in path.read_text(errors="ignore").splitlines():
-            if "=" in line:
-                key, value = line.split("=", 1)
-                data[key] = value.strip().strip('"')
-    return data
-
-
-def check_venv() -> bool:
-    print("\n[Project virtual environment]")
-    activate = ROOT / "venv" / "bin" / "activate"
-    python = ROOT / "venv" / "bin" / "python"
-    if activate.exists() and python.exists():
-        print(f"OK: {ROOT / 'venv'}")
-        return True
-    print("MISSING: ./venv")
-    print("Fix: run ./setup.sh from the project directory.")
-    print("The updated setup creates the venv before optional Hailo/Piper/Ollama steps.")
-    return False
-
-
-def check_i2c() -> bool:
-    print("\n[I2C / GY-521]")
-    dev = Path("/dev/i2c-1")
-    if not dev.exists():
-        print("FAIL: /dev/i2c-1 does not exist.")
-        print("Run: sudo raspi-config nonint do_i2c 0")
-        print("Then reboot: sudo reboot")
         return False
 
-    print("OK: /dev/i2c-1 exists")
-    ok, output = run("I2C scan", ["i2cdetect", "-y", "1"])
-    if not ok:
-        print("Install the scan utility with: sudo apt install i2c-tools")
-        return False
 
-    # i2cdetect may show 68 or UU. UU means a kernel driver owns the address.
-    detected = any(token.lower() in {"68", "uu"} for token in output.split())
-    if detected:
-        print("GY-521 candidate detected on I2C bus 1.")
-    else:
-        print("FAIL: address 0x68 was not visible in the scan.")
-        print("Check GY-521 wiring: VCC->3.3V, GND->GND, SDA->GPIO2/pin3, SCL->GPIO3/pin5.")
-        print("If AD0 is tied high, the MPU-6050 address is 0x69 instead of 0x68.")
-        return False
-
-    # Try WHO_AM_I without requiring smbus2.
-    if command("i2cget"):
-        who_ok, who_output = run("MPU-6050 WHO_AM_I", ["i2cget", "-y", "1", "0x68", "0x75"])
-        if who_ok:
-            value = who_output.splitlines()[-1].strip().lower()
-            if value == "0x68":
-                print("OK: MPU-6050 WHO_AM_I is 0x68")
-                return True
-            print(f"Unexpected WHO_AM_I value: {value}")
-            return False
-    return detected
-
-
-def check_hailo() -> bool:
-    print("\n[Hailo AI HAT+]")
-    cli = command("hailortcli")
-    if cli:
-        print(f"hailortcli: {cli}")
-        ok, _ = run("Hailo identify", ["hailortcli", "fw-control", "identify"])
-        if ok:
-            return True
-        print("hailortcli is installed but the device is not ready. Reboot after hailo-all/DKMS installation.")
-    else:
-        print("FAIL: hailortcli is not installed.")
-
-    if command("dpkg-query"):
-        run("hailo-all package", ["dpkg-query", "-W", "-f=${Status} ${Version}\\n", "hailo-all"])
-    if command("apt-cache"):
-        available, _ = run("hailo-all repository", ["apt-cache", "policy", "hailo-all"])
-        if not available:
-            print("The Raspberry Pi repository may not provide hailo-all for this OS/repository configuration.")
-
-    if Path("/dev/hailo0").exists():
-        print("Kernel device exists: /dev/hailo0")
-    else:
-        print("Kernel device missing: /dev/hailo0")
-
-    if command("lspci"):
-        _, pci = run("PCIe devices", ["lspci", "-nn"])
-        lines = [line for line in pci.splitlines() if "hailo" in line.lower()]
-        if lines:
-            print("Hailo PCIe hardware is visible:")
-            for line in lines:
-                print("  " + line)
-        else:
-            print("No Hailo device was identified by name in lspci output.")
-
-    print("Fix on current Raspberry Pi OS: sudo apt update && sudo apt install dkms hailo-all && sudo reboot")
-    return False
-
-
-def check_camera() -> bool:
-    binary = "rpicam-still" if command("rpicam-still") else "rpicam-hello"
-    if not command(binary):
-        print("\n[Camera]\nMISSING: rpicam-apps. Install with: sudo apt install rpicam-apps")
-        return False
-    argv = [binary, "--list-cameras"] if binary == "rpicam-still" else [binary, "--list-cameras"]
-    ok, _ = run("Camera", argv)
-    return ok
-
-
-def check_ollama(name: str, base_url: str, model: str = "") -> bool:
-    print(f"\n[{name} AI] {base_url}")
-    if not base_url:
-        print("No base_url configured")
-        return False
-    tags_url = base_url.rstrip("/") + "/api/tags"
+def check_mpu(config):
+    print("\n[GY-521 / MPU-6050]")
     try:
-        with urllib.request.urlopen(tags_url, timeout=4) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        models = [m.get("name") or m.get("model") for m in payload.get("models", [])]
-        print("Models:", ", ".join(x for x in models if x) or "none")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        from smbus2 import SMBus
+        bus_id = int(config.get("i2c_bus", 1))
+        address = int(str(config.get("address", "0x68")), 0)
+        with SMBus(bus_id) as bus:
+            who = bus.read_byte_data(address, 0x75)
+        print(f"WHO_AM_I=0x{who:02X} (expected 0x68/0x69)")
+        if who not in (0x68, 0x69):
+            return False
+
+        from hardware import MPU6050Monitor
+        monitor = MPU6050Monitor(config)
+        if not monitor.start():
+            print("Monitor start failed:", monitor.snapshot().get("last_error"))
+            return False
+        try:
+            import time
+            print("Keep the robot still for rest calibration, then tilt it if you want to watch the values change.")
+            for index in range(3):
+                time.sleep(0.4)
+                state = monitor.snapshot()
+                print(
+                    f"sample {index+1}: moving={state['moving']} "
+                    f"roll_rest={state['roll_from_rest_deg']}° "
+                    f"pitch_rest={state['pitch_from_rest_deg']}° "
+                    f"tilt_rest={state['total_tilt_from_rest_deg']}° "
+                    f"accel={state['acceleration_g']} gyro={state['gyro_dps']}"
+                )
+        finally:
+            monitor.stop()
+        return True
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return False
+
+
+def check_ollama(name, base_url, expected_model=None):
+    print(f"\n[{name} AI] {base_url}")
+    try:
+        response = requests.get(base_url.rstrip("/") + "/api/tags", timeout=4)
+        response.raise_for_status()
+        models = [m.get("name") or m.get("model") for m in response.json().get("models", [])]
+        models = [x for x in models if x]
+        print("Models:", ", ".join(models) or "none")
+        if expected_model:
+            if expected_model in models:
+                print(f"Configured model OK: {expected_model}")
+            else:
+                print(f"ERROR: configured model {expected_model} is not installed on this backend")
+                return False
+        return True
+    except Exception as exc:
         print(f"Unavailable: {exc}")
         return False
 
-    if not model:
-        return True
 
-    # Exercise the same keep_alive type used by the agent. This catches the
-    # historical JSON string "-1" error before the GUI is started.
-    generate_url = base_url.rstrip("/") + "/api/generate"
-    body = json.dumps({
-        "model": model,
-        "prompt": "",
-        "stream": False,
-        "keep_alive": -1,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        generate_url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            response.read()
-        print(f"Inference API OK: {model} (numeric keep_alive=-1)")
-        return True
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        print(f"Inference API failed: HTTP {exc.code}: {detail}")
-        return False
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        print(f"Inference API failed: {exc}")
-        return False
-
-
-def main() -> int:
+def main():
     print("Be More Agent hardware check")
-    info = os_info()
-    try:
-        model = Path("/proc/device-tree/model").read_bytes().replace(b"\x00", b"").decode(errors="ignore")
-    except Exception:
-        model = "unknown"
-    print(f"Board: {model}")
     print(f"Platform: {platform.platform()} | machine={platform.machine()}")
-    print(f"OS: {info.get('PRETTY_NAME', 'unknown')} | codename={info.get('VERSION_CODENAME', 'unknown')}")
-    print(f"Python: {sys.executable}")
-
-    config_path = ROOT / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    config = json.loads(Path("config.json").read_text(encoding="utf-8"))
 
     print("\n[Configured wiring]")
-    print("GY-521: SDA GPIO2/pin3, SCL GPIO3/pin5, INT GPIO24/pin18")
-    print("MAX98357A: DIN GPIO21/pin40, BCLK GPIO18/pin12, LRCLK GPIO19/pin35")
+    print("GY-521: SDA GPIO2, SCL GPIO3, INT GPIO24")
+    print("MAX98357A: DIN GPIO21, BCLK GPIO18, LRCLK GPIO19")
 
-    results = {
-        "venv": check_venv(),
-        "i2c": check_i2c(),
-        "hailo": check_hailo(),
-        "camera": check_camera(),
-    }
-
-    audio_play, _ = run("ALSA playback", ["aplay", "-l"])
-    audio_cap, _ = run("ALSA capture / USB microphone", ["arecord", "-l"])
-    results["audio_playback"] = audio_play
-    results["audio_capture"] = audio_cap
+    run("I2C bus", ["i2cdetect", "-y", "1"])
+    check_mpu(config.get("hardware", {}).get("mpu6050", {}))
+    run("Hailo", ["hailortcli", "fw-control", "identify"])
+    run("Camera", ["rpicam-still", "--list-cameras"])
+    run("ALSA playback", ["aplay", "-l"])
+    run("ALSA capture", ["arecord", "-l"])
 
     backends = config.get("ai", {}).get("backends", {})
     for name in ("local", "thor"):
         backend = backends.get(name, {})
         if backend.get("type", "ollama") == "ollama":
-            results[f"ai_{name}"] = check_ollama(
-                name.upper(), backend.get("base_url", ""), backend.get("text_model", "")
-            )
+            check_ollama(name.upper(), backend.get("base_url", ""), backend.get("text_model"))
 
-    print("\n[Summary]")
-    for key, value in results.items():
-        print(f"  {'PASS' if value else 'FAIL'}  {key}")
-
-    core_ok = results.get("venv", False) and results.get("i2c", False)
-    if not core_ok:
-        print("\nRun ./setup.sh, reboot, then rerun this check before starting the agent.")
-    return 0 if core_ok else 1
+    print("\nIf the MAX98357A or I2C overlay was just installed, reboot before treating a failed check as a wiring fault.")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
