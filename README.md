@@ -18,337 +18,469 @@ Useful tuning:
 - If it fails to notice you started talking: lower `noise_multiplier` from 2.4 toward 2.0.
 
 
-5. Pull NVIDIA's Thor Ollama image
+1. Clean out the previous Ollama server attempts
+
+Run these commands on the Jetson AGX Thor:
+
+docker rm -f ollama-thor ollama 2>/dev/null || true
+sudo systemctl stop ollama 2>/dev/null || true
+sudo pkill -f "ollama serve" 2>/dev/null || true
+
+Now check port 11434:
+
+sudo ss -lntp | grep 11434
+
+At this stage it should return nothing.
+
+Also verify there are no containers still running:
+
+docker ps
+2. Verify the Thor itself first
 
 Run:
 
-docker pull ghcr.io/nvidia-ai-iot/ollama:r38.2.arm64-sbsa-cu130-24.04
+uname -m
 
-Despite the older-looking R38 tag, this is still the specific Ollama image NVIDIA's current Jetson AI Lab documentation lists for Jetson Thor / SM110.
+Expected:
 
-Create persistent storage:
+aarch64
 
-mkdir -p ~/ollama-data
-6. Start the Thor Ollama server
+Then:
 
-Use:
+cat /etc/nv_tegra_release
 
-docker run -d \
-  --name ollama-thor \
-  --restart unless-stopped \
-  --runtime nvidia \
-  --network host \
-  -e OLLAMA_HOST=0.0.0.0:11434 \
-  -e OLLAMA_KEEP_ALIVE=-1m \
-  -v "$HOME/ollama-data:/data" \
-  ghcr.io/nvidia-ai-iot/ollama:r38.2.arm64-sbsa-cu130-24.04
+And most importantly:
 
-The important pieces are:
+nvidia-smi
 
---runtime nvidia
+You need nvidia-smi to actually display the NVIDIA Thor GPU before continuing. Thor uses NVIDIA's SBSA GPU driver, and NVIDIA specifically recommends nvidia-smi for monitoring the Thor GPU.
 
-which gives Ollama access to Thor's GPU, and:
+Something resembling:
 
---network host
+NVIDIA-SMI ...
+Driver Version: ...
+CUDA Version: ...
 
-which exposes:
+GPU  Name
+0    NVIDIA Thor
 
-http://THOR-IP:11434
+is what matters.
 
-to your Raspberry Pi.
+If:
 
-There have been Thor cases where Ollama silently fell back to CPU when the NVIDIA runtime wasn't active, so explicitly specifying --runtime nvidia is important.
+No devices were found
 
-Check the server:
+appears, stop there—the GPU/JetPack installation needs to be repaired before Ollama.
 
-docker logs ollama-thor
-7. Install Qwen 3.5 27B
+3. Optional: put Thor into maximum-performance mode
 
-Your current Pi configuration expects:
+For testing:
 
-qwen3.5:27b
+sudo nvpmodel -m 0
 
-Install it:
+Then check:
 
-docker exec -it ollama-thor ollama pull qwen3.5:27b
+sudo nvpmodel -q
 
-Qwen 3.5 27B is about 17 GB in Ollama's Q4_K_M package, and it supports:
+If it tells you a reboot is required:
 
-text
-images
-tool calling
-thinking/reasoning
+sudo reboot
+4. Install native Ollama
 
-so it can serve as both your Thor LLM and VLM.
+After reboot:
 
-Then test:
+sudo apt update
+sudo apt install -y curl
 
-docker exec -it ollama-thor ollama run qwen3.5:27b
+Then install Ollama using the official installer:
 
-Ask:
+curl -fsSL https://ollama.com/install.sh | sh
 
-What are you?
+Both NVIDIA's Jetson AI Lab and Ollama's own Linux documentation support this installation method. The installer creates a systemd service for ollama serve.
 
-Exit with:
+Check it:
 
-/bye
-8. Make sure the GPU is actually being used
+ollama --version
 
-Open a second terminal on the Thor:
+Then:
 
-sudo tegrastats
+sudo systemctl status ollama --no-pager
 
-Then run another Qwen query.
+You want:
 
-You should see GPU activity/power increase.
+active (running)
+5. First test Ollama locally
 
-Also run:
+Before changing any networking:
 
-docker exec ollama-thor ollama ps
+curl http://127.0.0.1:11434/api/version
 
-You do not want this:
-
-PROCESSOR
-100% CPU
-
-You want GPU usage reported.
-
-Jetson uses tegrastats for monitoring CPU/GPU/memory/thermals.
-
-9. Test the API directly on Thor
-
-Run:
+Then:
 
 curl http://127.0.0.1:11434/api/tags
 
-You should see JSON containing:
+If these fail, do not move on to the Pi yet.
 
-qwen3.5:27b
+Check the logs:
 
-Then test actual inference:
+journalctl -u ollama --no-pager -n 100
+
+Ollama documents journalctl -u ollama as the standard Linux server-log location.
+
+6. Expose Ollama to your LAN
+
+This is probably the step your current setup is missing.
+
+By default, Ollama listens only on:
+
+127.0.0.1:11434
+
+which means Thor itself can connect, but your:
+
+Raspberry Pi    ✗
+Phone           ✗
+Other PCs       ✗
+
+cannot.
+
+Ollama officially uses OLLAMA_HOST=0.0.0.0:11434 to expose the server to the network.
+
+Create a systemd override:
+
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+
+Then:
+
+sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<'EOF'
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+EOF
+
+Reload systemd:
+
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+sudo systemctl enable ollama
+
+Now check:
+
+sudo ss -lntp | grep 11434
+This is the critical result
+
+Good:
+
+0.0.0.0:11434
+
+or:
+
+[::]:11434
+
+Bad:
+
+127.0.0.1:11434
+
+If you still see 127.0.0.1, run:
+
+sudo systemctl cat ollama
+
+and verify you see:
+
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+7. Open the firewall
+
+Check:
+
+sudo ufw status
+
+If it's active:
+
+sudo ufw allow 11434/tcp
+
+Then:
+
+sudo ufw reload
+
+NVIDIA's own Jetson VLM troubleshooting specifically calls out opening TCP port 11434 when remote Ollama clients cannot connect.
+
+Do not forward port 11434 through your internet router. Ollama's local API does not require authentication, so you want this accessible only inside your trusted LAN.
+
+8. Find Thor's actual LAN address
+
+Use this rather than .local hostnames:
+
+ip route get 1.1.1.1
+
+You'll see something resembling:
+
+1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.82
+
+The important part is:
+
+src 192.168.1.82
+
+So your Thor IP would be:
+
+192.168.1.82
+
+You can extract it automatically:
+
+THOR_IP=$(ip route get 1.1.1.1 | awk '{print $7; exit}')
+echo "$THOR_IP"
+9. Test the LAN IP from Thor itself
+
+Still on Thor:
+
+curl http://$THOR_IP:11434/api/tags
+
+This is an important test.
+
+You now need both of these to work:
+
+curl http://127.0.0.1:11434/api/tags
+
+and:
+
+curl http://$THOR_IP:11434/api/tags
+
+If localhost works but the LAN address doesn't, the server is still not properly bound or the host firewall is interfering.
+
+10. Install Qwen3.6 35B
+
+Now install your model:
+
+ollama pull qwen3.6:35b
+
+Ollama currently lists qwen3.6:35b as a 36B MoE model, approximately 24 GB in the standard Q4_K_M build, with a 256K context window and text/image support.
+
+Verify:
+
+ollama list
+
+You should see:
+
+qwen3.6:35b
+11. Test Qwen directly on Thor
+
+Run:
 
 curl http://127.0.0.1:11434/api/chat \
+  -H "Content-Type: application/json" \
   -d '{
-    "model":"qwen3.5:27b",
-    "messages":[
+    "model": "qwen3.6:35b",
+    "messages": [
       {
-        "role":"user",
-        "content":"Reply with exactly: Thor AI online"
+        "role": "user",
+        "content": "Reply exactly: Thor Qwen server is working"
       }
     ],
-    "stream":false,
-    "think":false,
-    "keep_alive":-1
+    "stream": false,
+    "think": false,
+    "keep_alive": -1
   }'
 
-You should get a JSON response containing:
+You should get a response containing:
 
-Thor AI online
+Thor Qwen server is working
 
-Notice:
+Remember:
 
 "keep_alive": -1
 
-is numeric. Don't use:
+is a number.
+
+Do not use:
 
 "keep_alive": "-1"
 
-because that caused the duration error you encountered on the Pi.
+because that caused your previous duration parsing error.
 
-10. Test from the Raspberry Pi
+12. Verify it is actually using Thor's GPU
 
-Now go to your Pi and run:
+Open another terminal on Thor:
 
-curl http://jetson-thor.local:11434/api/tags
+watch -n 1 nvidia-smi
 
-If that works, you're essentially connected.
+Then run another Qwen request.
 
-If not, use the Thor's IP:
+GPU utilization and memory usage should rise.
 
-curl http://192.168.1.82:11434/api/tags
+Also:
 
-substituting your actual Thor address.
+ollama ps
 
-Then test Qwen remotely:
+should show qwen3.6:35b loaded.
 
-curl http://jetson-thor.local:11434/api/chat \
-  -d '{
-    "model":"qwen3.5:27b",
-    "messages":[
-      {
-        "role":"user",
-        "content":"Say Thor connection successful."
-      }
-    ],
-    "stream":false,
-    "think":false
-  }'
-11. Set your Pi configuration
+This verifies:
 
-On the Raspberry Pi, your config.json should contain approximately:
+Ollama server
+      ↓
+Qwen3.6 35B
+      ↓
+Thor GPU
 
-"ai": {
-  "default_backend": "local",
+rather than CPU inference.
 
-  "backends": {
-    "local": {
-      "type": "ollama",
-      "base_url": "http://127.0.0.1:11434",
-      "text_model": "qwen3.5:2b",
-      "vision_model": "qwen3.5:2b"
-    },
+13. Test from your phone BEFORE the Raspberry Pi
 
-    "thor": {
-      "type": "ollama",
-      "base_url": "http://jetson-thor.local:11434",
-      "text_model": "qwen3.5:27b",
-      "vision_model": "qwen3.5:27b"
+Put your phone on the same Wi-Fi/LAN as Thor.
+
+In its browser enter:
+
+http://192.168.1.82:11434/api/tags
+
+using your actual Thor IP.
+
+You should get JSON showing your model.
+
+For example:
+
+{
+  "models": [
+    {
+      "name": "qwen3.6:35b"
     }
-  }
+  ]
 }
 
-I would leave:
+If this works, we know external LAN access is fixed.
 
-"default_backend": "local"
+If your phone still cannot connect
 
-because that's what you requested.
+The likely problem is now the network, not Thor.
 
-Then you can verbally say:
+Thor local API	Thor-IP API	Phone	Likely cause
+Fail	Fail	Fail	Ollama itself
+Works	Fail	Fail	Ollama binding/firewall
+Works	Works	Fail	Wi-Fi/VLAN/client isolation
+Works	Works	Works	Thor server is correct
 
-Hey BMO, switch to Thor.
+If the last remaining failure is the phone, check that it is not connected to:
 
-and the route becomes:
+Guest Wi-Fi
+IoT VLAN
+isolated SSID
+cellular data
 
-USB microphone
-      ↓
-Raspberry Pi
-      ↓
-Whisper transcription
-      ↓
-Jetson Thor
-      ↓
-Qwen 3.5 27B
-      ↓
-Raspberry Pi
-      ↓
-Piper
-      ↓
-speaker
+Many routers prevent wireless clients on guest networks from reaching LAN devices.
 
-Say:
+14. Test from the Raspberry Pi
 
-Hey BMO, switch to local.
+On the Pi:
 
-and it returns to Pi inference.
+ping -c 3 192.168.1.82
 
-12. Camera/VLM through Thor
+Then:
 
-This is one of the more useful parts of the setup.
+curl --connect-timeout 5 \
+  http://192.168.1.82:11434/api/tags
 
-When Thor mode is active and you say:
+Again substitute your IP.
 
-Hey BMO, what do you see?
+You should see:
 
-the intended pipeline is:
+qwen3.6:35b
 
-Pi Camera
-    ↓
-capture image
-    ↓
-Hailo-8
-    ↓
-object detections
-    │
-    ├─────────────────┐
-    ↓                 ↓
-image JPEG       object hints
-    │                 │
-    └────────┬────────┘
-             ↓
-         LAN/Wi-Fi
-             ↓
-      Jetson AGX Thor
-             ↓
-       Qwen 3.5 27B
-        multimodal
-             ↓
-    natural-language
-      scene analysis
-             ↓
-       Raspberry Pi
-             ↓
-          speaker
+Then test actual inference:
 
-Qwen 3.5 27B accepts image input, so you don't need a separate dedicated VLM initially.
+curl http://192.168.1.82:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6:35b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply exactly: Raspberry Pi connected to Thor"
+      }
+    ],
+    "stream": false,
+    "think": false,
+    "keep_alive": -1
+  }'
 
-That simplifies the architecture considerably.
+Expected:
 
-13. I would also install the 35B model
+Raspberry Pi connected to Thor
 
-Once 27B works correctly, Thor has enough memory to experiment with:
+At that point do not change anything else on the Thor. The server is proven working.
 
-docker exec -it ollama-thor ollama pull qwen3.5:35b
+15. Point BMO at the numeric IP
 
-It's about 24 GB in Ollama and is also multimodal/tool-capable.
+On the Pi, change BMO's config.json from:
 
-Then test:
+"base_url": "http://jetson-thor.local:11434"
 
-docker exec -it ollama-thor ollama run qwen3.5:35b
+to:
 
-For your robot, I'd compare:
+"base_url": "http://192.168.1.82:11434"
 
-Model	Role
-qwen3.5:2b	Pi emergency/offline fallback
-qwen3.5:27b	Thor default
-qwen3.5:35b	Thor higher-quality option
-qwen3.5:122b	Not my first choice for this robot
+with your real IP.
 
-Even though Thor's large unified memory makes very large models possible, latency matters more than squeezing the largest model into RAM for a conversational robot.
+Your Thor section should ultimately resemble:
 
-I expect 27B or 35B to be a substantially better balance.
+"thor": {
+  "type": "ollama",
+  "base_url": "http://192.168.1.82:11434",
+  "text_model": "qwen3.6:35b",
+  "vision_model": "qwen3.6:35b",
+  "keep_alive": -1,
+  "think": false,
+  "connect_timeout_seconds": 3.0,
+  "timeout_seconds": 45.0
+}
 
-14. Final test sequence
+Then start BMO:
 
-Once everything is installed, I would test in this exact order:
-
-# THOR
-docker ps
-
-docker exec ollama-thor ollama list
-
-docker exec ollama-thor ollama ps
-
-curl http://127.0.0.1:11434/api/tags
-
-Then on the Pi:
-
-ping jetson-thor.local
-
-curl http://jetson-thor.local:11434/api/tags
-
+cd ~/be-more-agent-main
 source venv/bin/activate
-python hardware_check.py
-
-Then launch:
-
 ./start_agent.sh
 
 Say:
 
-Hey BMO, what model are you using?
-
-Then:
-
 Hey BMO, switch to Thor.
 
-Then:
+The corrected build should not announce success unless the Pi can both contact Thor and find qwen3.6:35b.
 
-Hey BMO, what model are you using?
+Then ask:
 
-Finally:
+What model are you using?
 
-Hey BMO, look at the camera and describe what you see.
+And watch the Pi terminal.
 
-If all four work, the complete Pi ↔ Thor LLM/VLM architecture is operational.
+You specifically want:
 
-One improvement I would make after that is to have the Pi automatically use Thor whenever it is reachable and plugged into your home network, while preserving Pi-local mode as the fallback, rather than requiring manual switching every time.
+[AI ROUTE] requested=thor actual=thor model=qwen3.6:35b
+
+That is now the definitive test.
+
+The complete working architecture
+Raspberry Pi 5
+│
+├── USB microphone
+├── Whisper STT
+├── wake word
+├── GY-521
+├── Pi camera
+├── Hailo-8
+├── Piper TTS
+│
+└── Ethernet / Wi-Fi
+        │
+        ▼
+192.168.1.82:11434
+        │
+        ▼
+Jetson AGX Thor
+        │
+      Ollama
+        │
+        ▼
+Qwen3.6 35B
+   ├── LLM
+   ├── VLM
+   └── tools
+
+The single most important checkpoint is this command on Thor:
+
+sudo ss -lntp | grep 11434
+
+It must show 0.0.0.0:11434 or [::]:11434. Once that does, curl http://THOR_IP:11434/api/tags should work from Thor, then your phone, then the Pi. If one stage fails, that tells us exactly which layer is broken.
