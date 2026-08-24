@@ -9,3 +9,4 @@ smbus2
 gpiozero
 ddgs
 Pillow
+httpx

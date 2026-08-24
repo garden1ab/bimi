@@ -421,6 +421,15 @@ class BotGUI:
         self.last_progress_time = time.monotonic()
         self.warmed_up = False
 
+        # Guards every "start this worker if it is not already running" check.
+        # Without it the watchdog and agent-main can both observe a thread that
+        # has been assigned but not yet started and each spawn their own copy.
+        self._thread_lock = threading.RLock()
+        # Set once stdin is known to be closed/EOF (autostart, systemd, nohup).
+        # select() reports an EOF stdin as permanently readable, so the terminal
+        # fallback has to be disabled instead of firing on every loop pass.
+        self._stdin_usable = self._stdin_is_interactive()
+
         self.ai = AIBackendManager(CURRENT_CONFIG.get("ai", {}), OLLAMA_OPTIONS)
         self.motion = MPU6050Monitor(CURRENT_CONFIG.get("hardware", {}).get("mpu6050", {}))
         self.vision = CameraVision(CURRENT_CONFIG.get("camera", {}))
@@ -616,13 +625,24 @@ class BotGUI:
     def update_animation(self):
         if self.exiting:
             return
-        frames = self.animations.get(self.current_state) or self.animations[BotStates.IDLE]
-        if self.current_state == BotStates.SPEAKING and len(frames) > 1:
-            self.current_frame_index = random.randint(1, len(frames) - 1)
-        else:
-            self.current_frame_index = (self.current_frame_index + 1) % len(frames)
-        self.background_label.config(image=frames[self.current_frame_index])
-        self.master.after(50 if self.current_state == BotStates.SPEAKING else 500, self.update_animation)
+        state = self.current_state
+        try:
+            frames = self.animations.get(state) or self.animations.get(BotStates.IDLE) or []
+            # An empty frame list used to raise ZeroDivisionError on the modulo
+            # below and permanently kill the animation loop.
+            if frames:
+                if state == BotStates.SPEAKING and len(frames) > 1:
+                    self.current_frame_index = random.randint(1, len(frames) - 1)
+                else:
+                    self.current_frame_index = (self.current_frame_index + 1) % len(frames)
+                self.background_label.config(image=frames[self.current_frame_index])
+        except Exception as exc:
+            if not self.exiting:
+                print(f"[UI] Animation frame skipped: {exc}", flush=True)
+        try:
+            self.master.after(50 if state == BotStates.SPEAKING else 500, self.update_animation)
+        except tk.TclError:
+            pass
 
     def set_state(self, state: str, msg: str = "", cam_path: Optional[str] = None):
         # Logical state is thread-safe enough for event routing. Widget mutation
@@ -674,7 +694,14 @@ class BotGUI:
                     self.response_text.config(state=tk.DISABLED)
         except queue.Empty:
             pass
-        except tk.TclError:
+        except Exception as exc:
+            # This previously returned on TclError and let any other exception
+            # escape, and in both cases the reschedule below was skipped. One
+            # transient widget error therefore killed the UI updater for good:
+            # the agent kept working but the screen never changed again.
+            if not self.exiting:
+                print(f"[UI] Drain error ignored: {exc}", flush=True)
+        if self.exiting:
             return
         try:
             self.master.after(50, self._drain_ui_queue)
@@ -684,6 +711,20 @@ class BotGUI:
     # ------------------------------------------------------------------
     # Main listening loop
     # ------------------------------------------------------------------
+    @staticmethod
+    def _stdin_is_interactive() -> bool:
+        """Report whether the CLI Enter fallback can safely be polled.
+
+        When the agent is launched from an autostart entry, a systemd unit, or
+        with `nohup`, stdin is closed or attached to /dev/null. select() then
+        reports it readable forever because EOF counts as readable, so polling
+        it turns every loop iteration into a phantom Enter press.
+        """
+        try:
+            return bool(sys.stdin) and sys.stdin.isatty()
+        except Exception:
+            return False
+
     def _touch_progress(self, reason: str = ""):
         self.last_progress_time = time.monotonic()
         if reason and CURRENT_CONFIG.get("runtime", {}).get("debug_progress", False):
@@ -692,11 +733,16 @@ class BotGUI:
     def _ensure_tts_worker(self):
         if self.exiting:
             return
-        if self.tts_thread is None or not self.tts_thread.is_alive():
-            if self.tts_thread is not None:
-                print("[WATCHDOG] Restarting stopped TTS worker.", flush=True)
-            self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True, name="tts-worker")
-            self.tts_thread.start()
+        # agent-main, the watchdog, and error recovery all call this. Without the
+        # lock they can each see a thread that was assigned but not yet started
+        # and spawn a second worker; two workers then pop the same queue and
+        # fight over the single audio output device.
+        with self._thread_lock:
+            if self.tts_thread is None or not self.tts_thread.is_alive():
+                if self.tts_thread is not None:
+                    print("[WATCHDOG] Restarting stopped TTS worker.", flush=True)
+                self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True, name="tts-worker")
+                self.tts_thread.start()
 
     def _start_runtime_workers(self):
         """Called by Tk after mainloop starts; never blocks the GUI."""
@@ -717,12 +763,13 @@ class BotGUI:
     def _start_wake_loader_thread(self):
         if self.exiting:
             return
-        if self.wake_loader_thread is not None and self.wake_loader_thread.is_alive():
-            return
-        self.wake_loader_thread = threading.Thread(
-            target=self._wake_loader_worker, daemon=True, name="wake-model-loader"
-        )
-        self.wake_loader_thread.start()
+        with self._thread_lock:
+            if self.wake_loader_thread is not None and self.wake_loader_thread.is_alive():
+                return
+            self.wake_loader_thread = threading.Thread(
+                target=self._wake_loader_worker, daemon=True, name="wake-model-loader"
+            )
+            self.wake_loader_thread.start()
 
     def _wake_loader_worker(self):
         print("[INIT] Loading wake words in background...", flush=True)
@@ -771,9 +818,11 @@ class BotGUI:
                 model = Model(wakeword_models=wake_models, inference_framework="onnx")
             except TypeError:
                 model = Model(wakeword_model_paths=wake_models)
-            self.oww_model = model
+            # Publish the labels before the model: agent-main waits on
+            # oww_model, so assigning it last keeps the lookup tables consistent.
             self.wake_word_phrases = phrases
             self.wake_word_labels = labels
+            self.oww_model = model
             print("[INIT] Wake words loaded: " + ", ".join(phrases), flush=True)
         except Exception as exc:
             print(f"[WAKE] Could not load wake-word models: {exc}; Enter remains available.", flush=True)
@@ -783,23 +832,25 @@ class BotGUI:
     def _start_main_thread(self):
         if self.exiting:
             return
-        if self.main_thread is not None and self.main_thread.is_alive():
-            return
-        self.main_thread = threading.Thread(target=self.safe_main_execution, daemon=True, name="agent-main")
-        self.main_thread.start()
+        with self._thread_lock:
+            if self.main_thread is not None and self.main_thread.is_alive():
+                return
+            self.main_thread = threading.Thread(target=self.safe_main_execution, daemon=True, name="agent-main")
+            self.main_thread.start()
 
     def _start_motion_init_thread(self):
         """Initialize/retry the MPU-6050 without ever blocking voice startup."""
         if self.exiting:
             return
-        if self.motion_init_thread is not None and self.motion_init_thread.is_alive():
-            return
-        self.motion_init_thread = threading.Thread(
-            target=self._motion_init_worker,
-            daemon=True,
-            name="mpu6050-init",
-        )
-        self.motion_init_thread.start()
+        with self._thread_lock:
+            if self.motion_init_thread is not None and self.motion_init_thread.is_alive():
+                return
+            self.motion_init_thread = threading.Thread(
+                target=self._motion_init_worker,
+                daemon=True,
+                name="mpu6050-init",
+            )
+            self.motion_init_thread.start()
 
     def _motion_init_worker(self):
         retry_seconds = max(2.0, float(
@@ -830,13 +881,29 @@ class BotGUI:
         handles the other important failure mode: an unexpected exception that
         kills a worker while leaving the Tk GUI running.
         """
-        interval = max(1.0, float(CURRENT_CONFIG.get("runtime", {}).get("watchdog_interval_seconds", 2.0)))
+        runtime_cfg = CURRENT_CONFIG.get("runtime", {})
+        interval = max(1.0, float(runtime_cfg.get("watchdog_interval_seconds", 2.0)))
+        # A wedged-but-alive worker is the failure the progress timestamps were
+        # collected for; until now nothing ever read them, so a stall was never
+        # actually detected. Keep this comfortably above the longest legitimate
+        # single step (STT/AI/TTS timeouts) to avoid interrupting real work.
+        stall_limit = max(60.0, float(runtime_cfg.get("stall_timeout_seconds", 180.0)))
         while not self.exiting:
             try:
                 self._ensure_tts_worker()
                 if self.main_thread is not None and not self.main_thread.is_alive():
                     print("[WATCHDOG] agent-main stopped unexpectedly; restarting it.", flush=True)
                     self._start_main_thread()
+                elif time.monotonic() - self.last_progress_time > stall_limit:
+                    print(
+                        f"[WATCHDOG] No progress for {stall_limit:.0f}s; forcing recovery.",
+                        flush=True,
+                    )
+                    # Reset the clock first so a slow recovery is not treated as
+                    # a fresh stall on the very next pass.
+                    self._touch_progress("watchdog recovery")
+                    self._interrupt_current_work(queue_ptt=False)
+                    self.set_state(BotStates.IDLE, "Recovered from a stall - ready.")
             except Exception as exc:
                 print(f"[WATCHDOG] recovery check failed: {exc}", flush=True)
             time.sleep(interval)
@@ -884,7 +951,8 @@ class BotGUI:
         if not self.warmed_up:
             self.warmed_up = True
             self.set_state(BotStates.IDLE, "Ready - listening for wake or Enter.")
-            self._start_background_warmup()
+            # _start_runtime_workers already kicked warmup off; _start_background_warmup
+            # is idempotent now, so this no longer spawns a second warmup thread.
 
         self._ensure_tts_worker()
 
@@ -942,14 +1010,15 @@ class BotGUI:
     def _start_background_warmup(self):
         if self.exiting:
             return
-        if self.warmup_thread is not None and self.warmup_thread.is_alive():
-            return
-        self.warmup_thread = threading.Thread(
-            target=self._background_warmup_worker,
-            daemon=True,
-            name="ai-warmup",
-        )
-        self.warmup_thread.start()
+        with self._thread_lock:
+            if self.warmup_thread is not None and self.warmup_thread.is_alive():
+                return
+            self.warmup_thread = threading.Thread(
+                target=self._background_warmup_worker,
+                daemon=True,
+                name="ai-warmup",
+            )
+            self.warmup_thread.start()
 
     def _background_warmup_worker(self):
         try:
@@ -1008,14 +1077,24 @@ class BotGUI:
                         self.ptt_event.clear()
                         return "PTT"
 
-                    # Keep the original CLI-enter fallback when running in a terminal.
-                    try:
-                        rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
-                        if rlist:
-                            sys.stdin.readline()
-                            return "PTT"
-                    except Exception:
-                        pass
+                    # Keep the original CLI-enter fallback, but only when stdin is
+                    # a real terminal. A closed/redirected stdin is always
+                    # "readable" at EOF, which previously fired a phantom Enter
+                    # on every pass and made the agent loop on itself forever.
+                    if self._stdin_usable:
+                        try:
+                            rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
+                            if rlist:
+                                line = sys.stdin.readline()
+                                if line == "":
+                                    # EOF: stdin will never block again. Stop
+                                    # polling it instead of spinning on it.
+                                    print("[INPUT] stdin reached EOF; disabling the terminal Enter fallback.", flush=True)
+                                    self._stdin_usable = False
+                                else:
+                                    return "PTT"
+                        except Exception:
+                            self._stdin_usable = False
 
                     data, overflow = stream.read(input_size)
                     if overflow:
@@ -1030,10 +1109,15 @@ class BotGUI:
                     elif len(audio) > target_size:
                         audio = audio[:target_size]
 
+                    # openWakeWord is a streaming model: it keeps internal audio
+                    # feature state across calls. Skipping quiet frames breaks
+                    # that continuity and wrecks detection accuracy, so every
+                    # frame is fed. The amplitude check only skips the cheap
+                    # score scan below.
+                    self.oww_model.predict(audio)
                     current_max = int(np.max(np.abs(audio))) if len(audio) else 0
                     if current_max <= 200:
                         continue
-                    self.oww_model.predict(audio)
                     for model_name, scores in self.oww_model.prediction_buffer.items():
                         if not scores:
                             continue
@@ -1185,7 +1269,17 @@ class BotGUI:
                 blocksize=chunk_size,
                 dtype="float32",
             ):
+                # The chunk limits above are enforced inside the callback, so a
+                # stream that stops delivering callbacks would otherwise wedge
+                # agent-main here forever with the GUI stuck on "I'm listening".
+                # This wall-clock deadline bounds the wait no matter what the
+                # audio device does.
+                hard_deadline = time.monotonic() + max_record_time + calibration_time + 5.0
                 while not stop_event.is_set() and not self.exiting and not self.interrupted.is_set():
+                    if time.monotonic() >= hard_deadline:
+                        print("[AUDIO] Input stream stalled; abandoning this recording.", flush=True)
+                        stop_reason = "input stream stalled"
+                        break
                     sd.sleep(25)
         except Exception as exc:
             print(f"[AUDIO] Adaptive recording failed: {exc}", flush=True)
@@ -1223,8 +1317,15 @@ class BotGUI:
         try:
             sd.stop()
             time.sleep(0.1)
+            max_ptt_seconds = max(5.0, float(CURRENT_CONFIG.get("recording", {}).get("max_record_seconds", 20.0)))
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE):
+                # A held key or a wedged stream must not hold agent-main forever.
+                hard_deadline = time.monotonic() + max_ptt_seconds
                 while self.recording_active.is_set() and not self.exiting and not self.interrupted.is_set():
+                    if time.monotonic() >= hard_deadline:
+                        print(f"[AUDIO] PTT hit the {max_ptt_seconds:.0f}s safety limit.", flush=True)
+                        self.recording_active.clear()
+                        break
                     sd.sleep(50)
         except Exception as exc:
             print(f"[AUDIO] PTT recording failed: {exc}", flush=True)
@@ -1379,7 +1480,7 @@ class BotGUI:
             result = self.motion.calibrate_rest()
             if result.get("ok"):
                 self.respond_plain(
-                    f"Rest position calibrated. Roll and pitch are now zeroed to this pose."
+                    "Rest position calibrated. Roll and pitch are now zeroed to this pose."
                 )
             else:
                 self.respond_plain(f"I could not calibrate the accelerometer: {result.get('error', 'unknown error')}")
@@ -1431,6 +1532,8 @@ class BotGUI:
         final_text = ""
         fallback_notice = ""
         try:
+            # try/finally below guarantees the thinking-sound flag is cleared;
+            # the interrupted early-returns in this loop used to leave it set.
             for _ in range(5):
                 if self.interrupted.is_set():
                     return
@@ -1511,6 +1614,8 @@ class BotGUI:
             self.thinking_sound_active.clear()
             traceback.print_exc()
             self.respond_plain(f"I hit an internal error: {str(exc)[:120]}")
+        finally:
+            self.thinking_sound_active.clear()
 
     def respond_plain(self, text: str):
         self.thinking_sound_active.clear()
@@ -1562,8 +1667,13 @@ class BotGUI:
             with self.tts_queue_lock:
                 if self.tts_queue:
                     text = self.tts_queue.pop(0)
+                    # Mark the worker busy while still holding the lock. If this
+                    # happened after the lock was released, wait_for_tts could
+                    # observe an empty queue and an inactive worker in the gap,
+                    # return early, and let the next cycle's sd.stop() cut off
+                    # the reply the robot had only just started speaking.
+                    self.tts_active.set()
             if text:
-                self.tts_active.set()
                 try:
                     self.speak(text)
                 finally:
@@ -1745,4 +1855,9 @@ if __name__ == "__main__":
     print("--- SYSTEM STARTING ---", flush=True)
     root = tk.Tk()
     app = BotGUI(root)
-    root.mainloop()
+    # atexit was imported but never used, so a kill/crash lost the conversation.
+    atexit.register(app.save_chat_history)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        app.safe_exit()

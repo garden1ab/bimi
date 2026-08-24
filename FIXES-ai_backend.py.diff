@@ -1,0 +1,60 @@
+--- bimi-orig/ai_backend.py	2026-08-24 21:29:13.222908624 +0000
++++ bimi-main/ai_backend.py	2026-08-24 21:31:17.704780372 +0000
+@@ -13,7 +13,7 @@
+ import json
+ import re
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Optional
++from typing import Any, Dict, List, Optional
+ 
+ import requests
+ import httpx
+@@ -343,7 +343,14 @@
+             ):
+                 print(f"[AI] {target} failed ({exc}); falling back to local and changing active state.", flush=True)
+                 local_model = self.get_model(vision=vision, backend="local")
+-                response = self._chat_backend("local", messages, tools=tools, vision=vision, image_path=image_path)
++                try:
++                    response = self._chat_backend("local", messages, tools=tools, vision=vision, image_path=image_path)
++                except Exception as local_exc:
++                    # Surface both failures as one clean error rather than
++                    # letting the fallback's exception escape unwrapped.
++                    raise AIBackendError(
++                        f"{target} failed ({exc}) and the local fallback also failed ({local_exc})"
++                    ) from local_exc
+                 # Keep the UI/status truthful after a remote failure.  The user
+                 # can explicitly switch back to Thor once its health check passes.
+                 self.current_backend = "local"
+@@ -470,7 +477,31 @@
+         if keep_alive is not None:
+             kwargs["keep_alive"] = keep_alive
+ 
+-        response = client.chat(**kwargs)
++        # `think` is only accepted by newer ollama-python releases. On an older
++        # client every request otherwise died with an unexpected-keyword
++        # TypeError, which surfaced as "my AI backend is unavailable" for the
++        # entire session. Drop unsupported kwargs and retry instead of failing.
++        response = None
++        for _attempt in range(3):
++            try:
++                response = client.chat(**kwargs)
++                break
++            except TypeError as exc:
++                dropped = None
++                for candidate in ("think", "keep_alive", "options"):
++                    if candidate in kwargs and candidate in str(exc):
++                        dropped = candidate
++                        break
++                if dropped is None:
++                    raise
++                print(
++                    f"[AI] Installed ollama client rejected '{dropped}'; retrying without it.",
++                    flush=True,
++                )
++                kwargs.pop(dropped, None)
++        if response is None:
++            raise AIBackendError("the installed ollama client rejected the request parameters")
++
+         response_dict = _as_dict(response)
+         message = _as_dict(response_dict.get("message", getattr(response, "message", None)))
+         normalized = self._normalize_message(message)
