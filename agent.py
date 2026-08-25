@@ -139,13 +139,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "sda_gpio": 2,
             "scl_gpio": 3,
             "interrupt_gpio": 24,
-            "poll_hz": 20,
+            "poll_hz": 10,
             "accel_delta_threshold_g": 0.08,
             "accel_magnitude_threshold_g": 0.12,
             "gyro_threshold_dps": 18.0,
             "motion_hold_seconds": 2.5,
             "interrupt_threshold_mg": 80,
             "interrupt_duration_ms": 20,
+            "retry_seconds": 15.0,
+            "start_after_audio_seconds": 1.0,
         },
         "max98357a": {
             "enabled": True,
@@ -384,21 +386,15 @@ class BotGUI:
         self.master = master
         master.title("Pi Assistant")
         master.attributes("-fullscreen", True)
-        # bind_all routes keys to any widget in this application, but the window
-        # manager still has to give the toplevel keyboard focus in the first
-        # place. On a fullscreen Pi kiosk it frequently does not, which makes
-        # Enter, Space AND Escape all appear dead at once. Claim focus and
-        # re-assert it, and also refocus whenever the window is clicked/exposed.
-        try:
-            master.attributes("-topmost", True)
-        except Exception:
-            pass
+        # Keep keyboard recovery independent from whichever child widget has
+        # focus, but do not continuously force focus on <FocusOut>. Reclaiming
+        # focus from inside a FocusOut handler can create a window-manager focus
+        # loop that makes the GUI appear frozen.
         master.bind_all("<Escape>", self.exit_fullscreen)
         master.bind_all("<Return>", self.handle_ptt_toggle)
         master.bind_all("<KP_Enter>", self.handle_ptt_toggle)
         master.bind_all("<space>", self.handle_speaking_interrupt)
         master.bind("<Visibility>", self._claim_focus)
-        master.bind("<FocusOut>", self._claim_focus)
 
         self.current_state = BotStates.WARMUP
         self.current_volume = 0
@@ -429,6 +425,10 @@ class BotGUI:
         self.wake_model_ready = threading.Event()
         self._wake_unavailable_notified = False
         self._last_wake_level_log = 0.0
+        # agent-main is the sole owner of the capture device. Diagnostics, wake
+        # detection, VAD and PTT must never open the USB microphone concurrently.
+        self._input_lock = threading.Lock()
+        self.audio_ready = threading.Event()
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self.current_audio_process: Optional[subprocess.Popen] = None
         self.exiting = False
@@ -788,24 +788,34 @@ class BotGUI:
             return
         print("[RUNTIME] Tk event loop online; starting voice/background workers.", flush=True)
         self._claim_focus()
-        # Re-assert focus shortly after mapping; some window managers steal it
-        # back once the fullscreen window finishes being drawn.
-        for delay in (500, 1500, 4000):
-            try:
-                self.master.after(delay, self._claim_focus)
-            except Exception:
-                pass
-        self._start_microphone_self_test()
+        # One delayed focus claim is enough for fullscreen kiosk startup. Never
+        # bind a perpetual FocusOut -> focus_force loop.
+        try:
+            self.master.after(750, self._claim_focus)
+        except Exception:
+            pass
+
+        # Voice input gets absolute startup priority. The previous build opened
+        # a microphone self-test concurrently with the wake stream, which can
+        # wedge single-client USB capture devices under PortAudio/ALSA.
         self._start_wake_loader_thread()
         self._start_main_thread()
         self.watchdog_thread = threading.Thread(
             target=self._runtime_watchdog, daemon=True, name="agent-watchdog"
         )
         self.watchdog_thread.start()
+
+        # Optional diagnostics are OFF by default and, when requested, wait until
+        # agent-main has proven the capture path is available.
+        if CURRENT_CONFIG.get("runtime", {}).get("microphone_self_test_on_startup", False):
+            self._start_microphone_self_test()
+
+        # Motion and model warmup are deliberately deferred until the primary
+        # human input path is online. A bad I2C bus or CPU-heavy Ollama load must
+        # never delay Hey BMO / Enter.
         self._start_motion_init_thread()
-        # AI warmup is intentionally delayed/background-only. Voice input is
-        # available regardless of Ollama/Thor state.
-        self._start_background_warmup()
+        if CURRENT_CONFIG.get("runtime", {}).get("warmup_on_startup", False):
+            self._start_background_warmup()
 
     def _start_microphone_self_test(self):
         """Measure and report real capture levels so a dead mic is obvious.
@@ -820,6 +830,15 @@ class BotGUI:
         threading.Thread(target=self._microphone_self_test, daemon=True, name="mic-selftest").start()
 
     def _microphone_self_test(self):
+        # Never race agent-main for the capture device. This diagnostic is only
+        # allowed after the primary input path has initialized and only if the
+        # input lock is momentarily free.
+        if not self.audio_ready.wait(timeout=10.0) or self.exiting:
+            print("[MICTEST] Skipped: primary audio path did not become ready.", flush=True)
+            return
+        if not self._input_lock.acquire(blocking=False):
+            print("[MICTEST] Skipped: microphone is in use by wake/VAD.", flush=True)
+            return
         try:
             samplerate = choose_input_samplerate(INPUT_DEVICE, CURRENT_CONFIG.get("input_sample_rate"))
             try:
@@ -866,6 +885,11 @@ class BotGUI:
                 )
         except Exception as exc:
             print(f"[MICTEST] Microphone self-test failed: {exc}", flush=True)
+        finally:
+            try:
+                self._input_lock.release()
+            except RuntimeError:
+                pass
 
     def _start_wake_loader_thread(self):
         if self.exiting:
@@ -1015,9 +1039,22 @@ class BotGUI:
             self.motion_init_thread.start()
 
     def _motion_init_worker(self):
-        retry_seconds = max(2.0, float(
-            CURRENT_CONFIG.get("hardware", {}).get("mpu6050", {}).get("retry_seconds", 10.0)
-        ))
+        motion_cfg = CURRENT_CONFIG.get("hardware", {}).get("mpu6050", {})
+        if not motion_cfg.get("enabled", True):
+            print("[MPU6050] Disabled by configuration.", flush=True)
+            return
+        retry_seconds = max(2.0, float(motion_cfg.get("retry_seconds", 15.0)))
+        startup_delay = max(0.0, float(motion_cfg.get("start_after_audio_seconds", 1.0)))
+
+        print("[MPU6050] Waiting for primary audio path before initializing I2C...", flush=True)
+        while not self.exiting and not self.audio_ready.wait(timeout=0.5):
+            pass
+        if self.exiting:
+            return
+        deadline = time.monotonic() + startup_delay
+        while not self.exiting and time.monotonic() < deadline:
+            time.sleep(0.1)
+
         attempt = 0
         while not self.exiting:
             attempt += 1
@@ -1189,8 +1226,14 @@ class BotGUI:
             self.warmup_thread.start()
 
     def _background_warmup_worker(self):
+        # On a Pi 5, loading/evaluating Qwen can saturate the CPU. Do not compete
+        # with ONNX wake-word startup or initial PortAudio stream creation.
+        if not self.audio_ready.wait(timeout=20.0) or self.exiting:
+            print("[AI] Startup warmup skipped because audio did not become ready.", flush=True)
+            return
+        time.sleep(1.0)
         try:
-            print("[AI] Background warmup started; voice input remains active.", flush=True)
+            print("[AI] Background warmup started after audio became ready.", flush=True)
             self.ai.warmup()
             print(f"[AI] Background warmup complete: {self.ai.status_text()}", flush=True)
         except Exception as exc:
@@ -1228,6 +1271,7 @@ class BotGUI:
                         flush=True,
                     )
                     self.set_state(BotStates.IDLE, "Ready - press Enter (no wake word)")
+                    self.audio_ready.set()
                 while not self.exiting:
                     if self.ptt_event.wait(timeout=0.5):
                         self.ptt_event.clear()
@@ -1243,83 +1287,86 @@ class BotGUI:
         input_size = max(1, int(round(target_size * input_rate / target_rate)))
 
         try:
-            with sd.InputStream(
-                samplerate=input_rate,
-                channels=1,
-                dtype="int16",
-                blocksize=input_size,
-                device=INPUT_DEVICE,
-                latency="high",
-            ) as stream:
-                print(f"[AUDIO] Wake listening at {input_rate} Hz", flush=True)
-                while not self.exiting:
-                    if self.ptt_event.is_set():
-                        self.ptt_event.clear()
-                        return "PTT"
+            with self._input_lock:
+                with sd.InputStream(
+                    samplerate=input_rate,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=input_size,
+                    device=INPUT_DEVICE,
+                    latency="high",
+                ) as stream:
+                    self.audio_ready.set()
+                    print(f"[AUDIO] Wake listening at {input_rate} Hz", flush=True)
+                    while not self.exiting:
+                        if self.ptt_event.is_set():
+                            self.ptt_event.clear()
+                            return "PTT"
 
-                    # Keep the original CLI-enter fallback, but only when stdin is
-                    # a real terminal. A closed/redirected stdin is always
-                    # "readable" at EOF, which previously fired a phantom Enter
-                    # on every pass and made the agent loop on itself forever.
-                    if self._stdin_usable:
-                        try:
-                            rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
-                            if rlist:
-                                line = sys.stdin.readline()
-                                if line == "":
-                                    # EOF: stdin will never block again. Stop
-                                    # polling it instead of spinning on it.
-                                    print("[INPUT] stdin reached EOF; disabling the terminal Enter fallback.", flush=True)
-                                    self._stdin_usable = False
-                                else:
-                                    return "PTT"
-                        except Exception:
-                            self._stdin_usable = False
+                        # Keep the original CLI-enter fallback, but only when stdin is
+                        # a real terminal. A closed/redirected stdin is always
+                        # "readable" at EOF, which previously fired a phantom Enter
+                        # on every pass and made the agent loop on itself forever.
+                        if self._stdin_usable:
+                            try:
+                                rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
+                                if rlist:
+                                    line = sys.stdin.readline()
+                                    if line == "":
+                                        # EOF: stdin will never block again. Stop
+                                        # polling it instead of spinning on it.
+                                        print("[INPUT] stdin reached EOF; disabling the terminal Enter fallback.", flush=True)
+                                        self._stdin_usable = False
+                                    else:
+                                        return "PTT"
+                            except Exception:
+                                self._stdin_usable = False
 
-                    data, overflow = stream.read(input_size)
-                    if overflow:
-                        print("[AUDIO] Wake input overflow", flush=True)
-                    audio = np.asarray(data, dtype=np.int16).reshape(-1)
-                    if input_rate != target_rate:
-                        gcd = np.gcd(input_rate, target_rate)
-                        audio = scipy.signal.resample_poly(audio, target_rate // gcd, input_rate // gcd)
-                        audio = np.asarray(audio[:target_size], dtype=np.int16)
-                    if len(audio) < target_size:
-                        audio = np.pad(audio, (0, target_size - len(audio)))
-                    elif len(audio) > target_size:
-                        audio = audio[:target_size]
+                        data, overflow = stream.read(input_size)
+                        if overflow:
+                            print("[AUDIO] Wake input overflow", flush=True)
+                        audio = np.asarray(data, dtype=np.int16).reshape(-1)
+                        if input_rate != target_rate:
+                            gcd = np.gcd(input_rate, target_rate)
+                            audio = scipy.signal.resample_poly(audio, target_rate // gcd, input_rate // gcd)
+                            audio = np.asarray(audio[:target_size], dtype=np.int16)
+                        if len(audio) < target_size:
+                            audio = np.pad(audio, (0, target_size - len(audio)))
+                        elif len(audio) > target_size:
+                            audio = audio[:target_size]
 
-                    # openWakeWord is a streaming model: it keeps internal audio
-                    # feature state across calls. Skipping quiet frames breaks
-                    # that continuity and wrecks detection accuracy, so every
-                    # frame is fed. The amplitude check only skips the cheap
-                    # score scan below.
-                    self.oww_model.predict(audio)
-                    current_max = int(np.max(np.abs(audio))) if len(audio) else 0
+                        # openWakeWord is a streaming model: it keeps internal audio
+                        # feature state across calls. Skipping quiet frames breaks
+                        # that continuity and wrecks detection accuracy, so every
+                        # frame is fed. The amplitude check only skips the cheap
+                        # score scan below.
+                        self.oww_model.predict(audio)
+                        current_max = int(np.max(np.abs(audio))) if len(audio) else 0
 
-                    # Periodic level reporting turns "it can't hear me" from a
-                    # guess into an observation: a flat 0 peak here means the
-                    # capture device is wrong or muted, not that the wake model
-                    # is at fault.
-                    if CURRENT_CONFIG.get("runtime", {}).get("debug_audio", False):
-                        now_mono = time.monotonic()
-                        if now_mono - self._last_wake_level_log >= 2.0:
-                            self._last_wake_level_log = now_mono
-                            print(f"[AUDIO] wake input peak={current_max}/32767", flush=True)
+                        # Periodic level reporting turns "it can't hear me" from a
+                        # guess into an observation: a flat 0 peak here means the
+                        # capture device is wrong or muted, not that the wake model
+                        # is at fault.
+                        if CURRENT_CONFIG.get("runtime", {}).get("debug_audio", False):
+                            now_mono = time.monotonic()
+                            if now_mono - self._last_wake_level_log >= 2.0:
+                                self._last_wake_level_log = now_mono
+                                print(f"[AUDIO] wake input peak={current_max}/32767", flush=True)
 
-                    if current_max <= 200:
-                        continue
-                    for model_name, scores in self.oww_model.prediction_buffer.items():
-                        if not scores:
+                        if current_max <= 200:
                             continue
-                        score = float(list(scores)[-1])
-                        if score > self.wake_word_threshold:
-                            phrase = self.wake_word_labels.get(model_name, model_name)
-                            print(f"[WAKE] {phrase}: {score:.2f}", flush=True)
-                            self.oww_model.reset()
-                            return "WAKE"
+                        for model_name, scores in self.oww_model.prediction_buffer.items():
+                            if not scores:
+                                continue
+                            score = float(list(scores)[-1])
+                            if score > self.wake_word_threshold:
+                                phrase = self.wake_word_labels.get(model_name, model_name)
+                                print(f"[WAKE] {phrase}: {score:.2f}", flush=True)
+                                self.oww_model.reset()
+                                return "WAKE"
         except Exception as exc:
-            print(f"[WAKE] Stream failed: {exc}; falling back to PTT.", flush=True)
+            self.audio_ready.set()
+            print(f"[WAKE] Stream failed: {exc}; falling back to Enter/PTT.", flush=True)
             self.ptt_event.wait()
             self.ptt_event.clear()
             return "PTT"
@@ -1472,30 +1519,32 @@ class BotGUI:
         try:
             sd.stop()
             time.sleep(0.05)
-            with sd.InputStream(
-                samplerate=samplerate,
-                channels=1,
-                callback=callback,
-                device=INPUT_DEVICE,
-                blocksize=chunk_size,
-                dtype="float32",
-            ):
-                # The chunk limits above are enforced inside the callback, so a
-                # stream that stops delivering callbacks would otherwise wedge
-                # agent-main here forever with the GUI stuck on "I'm listening".
-                # This wall-clock deadline bounds the wait no matter what the
-                # audio device does.
-                hard_deadline = time.monotonic() + max_record_time + calibration_time + 5.0
-                while not stop_event.is_set() and not self.exiting and not self.interrupted.is_set():
-                    if self.finish_recording.is_set() and not stop_event.is_set():
-                        # Give the callback a moment to flush the final chunk.
-                        sd.sleep(int(chunk_duration * 1000) + 20)
-                        break
-                    if time.monotonic() >= hard_deadline:
-                        print("[AUDIO] Input stream stalled; abandoning this recording.", flush=True)
-                        stop_reason = "input stream stalled"
-                        break
-                    sd.sleep(25)
+            with self._input_lock:
+                with sd.InputStream(
+                    samplerate=samplerate,
+                    channels=1,
+                    callback=callback,
+                    device=INPUT_DEVICE,
+                    blocksize=chunk_size,
+                    dtype="float32",
+                ):
+                    self.audio_ready.set()
+                    # The chunk limits above are enforced inside the callback, so a
+                    # stream that stops delivering callbacks would otherwise wedge
+                    # agent-main here forever with the GUI stuck on "I'm listening".
+                    # This wall-clock deadline bounds the wait no matter what the
+                    # audio device does.
+                    hard_deadline = time.monotonic() + max_record_time + calibration_time + 5.0
+                    while not stop_event.is_set() and not self.exiting and not self.interrupted.is_set():
+                        if self.finish_recording.is_set() and not stop_event.is_set():
+                            # Give the callback a moment to flush the final chunk.
+                            sd.sleep(int(chunk_duration * 1000) + 20)
+                            break
+                        if time.monotonic() >= hard_deadline:
+                            print("[AUDIO] Input stream stalled; abandoning this recording.", flush=True)
+                            stop_reason = "input stream stalled"
+                            break
+                        sd.sleep(25)
         except Exception as exc:
             print(f"[AUDIO] Adaptive recording failed: {exc}", flush=True)
             return None
@@ -1534,17 +1583,19 @@ class BotGUI:
             sd.stop()
             time.sleep(0.1)
             max_ptt_seconds = max(5.0, float(CURRENT_CONFIG.get("recording", {}).get("max_record_seconds", 20.0)))
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE):
-                # A held key or a wedged stream must not hold agent-main forever.
-                hard_deadline = time.monotonic() + max_ptt_seconds
-                while self.recording_active.is_set() and not self.exiting and not self.interrupted.is_set():
-                    if self.finish_recording.is_set():
-                        break
-                    if time.monotonic() >= hard_deadline:
-                        print(f"[AUDIO] PTT hit the {max_ptt_seconds:.0f}s safety limit.", flush=True)
-                        self.recording_active.clear()
-                        break
-                    sd.sleep(50)
+            with self._input_lock:
+                with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE):
+                    self.audio_ready.set()
+                    # A held key or a wedged stream must not hold agent-main forever.
+                    hard_deadline = time.monotonic() + max_ptt_seconds
+                    while self.recording_active.is_set() and not self.exiting and not self.interrupted.is_set():
+                        if self.finish_recording.is_set():
+                            break
+                        if time.monotonic() >= hard_deadline:
+                            print(f"[AUDIO] PTT hit the {max_ptt_seconds:.0f}s safety limit.", flush=True)
+                            self.recording_active.clear()
+                            break
+                        sd.sleep(50)
         except Exception as exc:
             print(f"[AUDIO] PTT recording failed: {exc}", flush=True)
             return None

@@ -45,7 +45,7 @@ class MPU6050Monitor:
         self.bus_id = int(self.config.get("i2c_bus", 1))
         self.address = int(str(self.config.get("address", "0x68")), 0)
         self.interrupt_gpio = int(self.config.get("interrupt_gpio", 24))
-        self.poll_hz = float(self.config.get("poll_hz", 20.0))
+        self.poll_hz = float(self.config.get("poll_hz", 10.0))
         self.accel_delta_threshold_g = float(self.config.get("accel_delta_threshold_g", 0.08))
         self.accel_magnitude_threshold_g = float(self.config.get("accel_magnitude_threshold_g", 0.12))
         self.gyro_threshold_dps = float(self.config.get("gyro_threshold_dps", 18.0))
@@ -63,6 +63,7 @@ class MPU6050Monitor:
         self._io_lock = threading.RLock()
         self._available = False
         self._last_error = ""
+        self._consecutive_errors = 0
         self._last_vector: Optional[Tuple[float, float, float]] = None
         self._last_motion_time = 0.0
         self._last_interrupt_time = 0.0
@@ -147,6 +148,7 @@ class MPU6050Monitor:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._available = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         if self._gpio is not None:
@@ -261,12 +263,25 @@ class MPU6050Monitor:
         while not self._stop_event.is_set():
             try:
                 self._read_sample()
-                status = self._read_byte(self.INT_STATUS)
-                if status & 0x40:
-                    self._mark_motion()
+                # When GPIO24 is active, gpiozero already services the latched
+                # motion interrupt and reads INT_STATUS in the callback. Polling
+                # INT_STATUS again every sample doubles I2C traffic for no gain.
+                if self._gpio is None:
+                    status = self._read_byte(self.INT_STATUS)
+                    if status & 0x40:
+                        self._mark_motion()
                 self._last_error = ""
+                self._consecutive_errors = 0
+                self._available = True
             except Exception as exc:
                 self._last_error = str(exc)
+                self._consecutive_errors += 1
+                # A missing/wedged bus should not become a tight 10-20 Hz error
+                # loop. Back off after repeated failures while keeping the last
+                # cached state available to the rest of the agent.
+                if self._consecutive_errors >= 3:
+                    self._available = False
+                    self._stop_event.wait(min(1.0, 0.10 * self._consecutive_errors))
             self._stop_event.wait(delay)
 
     # ------------------------------------------------------------------

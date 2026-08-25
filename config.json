@@ -80,7 +80,7 @@
       "sda_gpio": 2,
       "scl_gpio": 3,
       "interrupt_gpio": 24,
-      "poll_hz": 20,
+      "poll_hz": 10,
       "accel_delta_threshold_g": 0.08,
       "accel_magnitude_threshold_g": 0.12,
       "gyro_threshold_dps": 18.0,
@@ -88,7 +88,9 @@
       "interrupt_threshold_mg": 80,
       "interrupt_duration_ms": 20,
       "rest_calibration_samples": 30,
-      "rest_calibration_interval_seconds": 0.02
+      "rest_calibration_interval_seconds": 0.02,
+      "retry_seconds": 15.0,
+      "start_after_audio_seconds": 1.0
     },
     "max98357a": {
       "enabled": true,
@@ -160,6 +162,8 @@
     "piper_process_timeout_seconds": 30.0,
     "debug_progress": false,
     "debug_audio": false,
-    "stall_timeout_seconds": 180.0
+    "stall_timeout_seconds": 180.0,
+    "microphone_self_test_on_startup": false,
+    "warmup_on_startup": false
   }
 }
