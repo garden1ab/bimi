@@ -461,6 +461,20 @@ class AIBackendManager:
         if isinstance(backend_options, dict):
             options.update(backend_options)
 
+        # Do not force a per-request context size on remote Ollama servers by
+        # default. Ollama may unload/reload an already-resident runner when
+        # num_ctx differs from the server/model context, which is especially
+        # disruptive for large Thor models. Let Thor own OLLAMA_CONTEXT_LENGTH
+        # unless explicitly opted back in with send_num_ctx_per_request=true.
+        send_num_ctx = bool(cfg.get("send_num_ctx_per_request", backend == "local"))
+        if not send_num_ctx and "num_ctx" in options:
+            inherited_ctx = options.pop("num_ctx", None)
+            print(
+                f"[AI] {backend}: inheriting Ollama server context "
+                f"(not sending per-request num_ctx={inherited_ctx}).",
+                flush=True,
+            )
+
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": payload_messages,
