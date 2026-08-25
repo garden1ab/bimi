@@ -1,0 +1,14 @@
+--- bimi-orig/config.json	2026-08-24 21:29:13.222983568 +0000
++++ bimi-main/config.json	2026-08-25 00:08:31.490602110 +0000
+@@ -158,6 +158,8 @@
+     "stt_timeout_seconds": 60.0,
+     "tts_timeout_seconds": 35.0,
+     "piper_process_timeout_seconds": 30.0,
+-    "debug_progress": false
++    "debug_progress": false,
++    "debug_audio": false,
++    "stall_timeout_seconds": 180.0
+   }
+-}
++}
+\ No newline at end of file

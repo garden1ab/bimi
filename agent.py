@@ -384,11 +384,21 @@ class BotGUI:
         self.master = master
         master.title("Pi Assistant")
         master.attributes("-fullscreen", True)
-        # bind_all keeps recovery keys working regardless of which widget owns focus.
+        # bind_all routes keys to any widget in this application, but the window
+        # manager still has to give the toplevel keyboard focus in the first
+        # place. On a fullscreen Pi kiosk it frequently does not, which makes
+        # Enter, Space AND Escape all appear dead at once. Claim focus and
+        # re-assert it, and also refocus whenever the window is clicked/exposed.
+        try:
+            master.attributes("-topmost", True)
+        except Exception:
+            pass
         master.bind_all("<Escape>", self.exit_fullscreen)
         master.bind_all("<Return>", self.handle_ptt_toggle)
         master.bind_all("<KP_Enter>", self.handle_ptt_toggle)
         master.bind_all("<space>", self.handle_speaking_interrupt)
+        master.bind("<Visibility>", self._claim_focus)
+        master.bind("<FocusOut>", self._claim_focus)
 
         self.current_state = BotStates.WARMUP
         self.current_volume = 0
@@ -403,6 +413,9 @@ class BotGUI:
         self.thinking_sound_active = threading.Event()
         self.ptt_event = threading.Event()
         self.recording_active = threading.Event()
+        # Distinct from `interrupted`: this means "I have finished speaking,
+        # transcribe what you already captured", not "throw the audio away".
+        self.finish_recording = threading.Event()
         self.interrupted = threading.Event()
         self.tts_active = threading.Event()
         self.tts_queue: List[str] = []
@@ -414,6 +427,8 @@ class BotGUI:
         self.warmup_thread: Optional[threading.Thread] = None
         self.wake_loader_thread: Optional[threading.Thread] = None
         self.wake_model_ready = threading.Event()
+        self._wake_unavailable_notified = False
+        self._last_wake_level_log = 0.0
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self.current_audio_process: Optional[subprocess.Popen] = None
         self.exiting = False
@@ -566,8 +581,19 @@ class BotGUI:
                 return "break"
             self.recording_active.set()
 
+        # Enter while LISTENING means "I'm done talking, process it now".
+        # LISTENING used to be lumped in with the busy states below, so this
+        # keypress ran the cancellation path and threw the recording away --
+        # which is exactly why Enter appeared not to end speech.
+        if self.current_state == BotStates.LISTENING:
+            print("[INPUT] Enter pressed while listening; finishing the utterance.", flush=True)
+            self.finish_recording.set()
+            self.recording_active.clear()
+            self._touch_progress("manual end of utterance")
+            return "break"
+
         busy_states = {
-            BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING,
+            BotStates.THINKING, BotStates.SPEAKING,
             BotStates.CAPTURING, BotStates.ERROR,
         }
         if self.current_state in busy_states:
@@ -711,6 +737,18 @@ class BotGUI:
     # ------------------------------------------------------------------
     # Main listening loop
     # ------------------------------------------------------------------
+    def _claim_focus(self, event=None):
+        """Ensure the window actually owns keyboard focus.
+
+        bind_all only routes keys that Tk already received. If the window
+        manager never focuses the toplevel, Enter/Space/Escape are all silently
+        dead, which reads as a total freeze even though the agent is healthy.
+        """
+        try:
+            self.master.focus_force()
+        except Exception:
+            pass
+
     @staticmethod
     def _stdin_is_interactive() -> bool:
         """Report whether the CLI Enter fallback can safely be polled.
@@ -749,6 +787,15 @@ class BotGUI:
         if self.exiting:
             return
         print("[RUNTIME] Tk event loop online; starting voice/background workers.", flush=True)
+        self._claim_focus()
+        # Re-assert focus shortly after mapping; some window managers steal it
+        # back once the fullscreen window finishes being drawn.
+        for delay in (500, 1500, 4000):
+            try:
+                self.master.after(delay, self._claim_focus)
+            except Exception:
+                pass
+        self._start_microphone_self_test()
         self._start_wake_loader_thread()
         self._start_main_thread()
         self.watchdog_thread = threading.Thread(
@@ -759,6 +806,66 @@ class BotGUI:
         # AI warmup is intentionally delayed/background-only. Voice input is
         # available regardless of Ollama/Thor state.
         self._start_background_warmup()
+
+    def _start_microphone_self_test(self):
+        """Measure and report real capture levels so a dead mic is obvious.
+
+        "It can't hear me" has many possible causes (wrong PortAudio device, a
+        muted ALSA capture control, zero gain, a mic that enumerates but returns
+        silence). Printing the measured peak/RMS at startup distinguishes them
+        immediately instead of leaving it to guesswork.
+        """
+        if self.exiting:
+            return
+        threading.Thread(target=self._microphone_self_test, daemon=True, name="mic-selftest").start()
+
+    def _microphone_self_test(self):
+        try:
+            samplerate = choose_input_samplerate(INPUT_DEVICE, CURRENT_CONFIG.get("input_sample_rate"))
+            try:
+                info = sd.query_devices(INPUT_DEVICE, "input")
+                device_name = info.get("name", "unknown")
+            except Exception:
+                device_name = "unknown"
+            seconds = 1.0
+            frames = max(1, int(samplerate * seconds))
+            captured: List[np.ndarray] = []
+            with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32",
+                                blocksize=1024, device=INPUT_DEVICE) as stream:
+                remaining = frames
+                while remaining > 0:
+                    block = min(1024, remaining)
+                    data, _overflow = stream.read(block)
+                    captured.append(np.asarray(data, dtype=np.float32).reshape(-1))
+                    remaining -= block
+            if not captured:
+                print("[MICTEST] No audio frames were returned by the input device.", flush=True)
+                return
+            audio = np.concatenate(captured)
+            audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+            min_rms = float(CURRENT_CONFIG.get("recording", {}).get("min_rms", 0.006))
+            print(
+                f"[MICTEST] device={device_name!r} rate={samplerate} peak={peak:.5f} rms={rms:.5f} "
+                f"(speech must exceed min_rms={min_rms:.5f})",
+                flush=True,
+            )
+            if peak <= 1e-6:
+                print(
+                    "[MICTEST] The microphone returned pure digital silence. Check that the correct "
+                    "capture device is selected ('input_device' in config.json) and that the ALSA "
+                    "capture volume is unmuted: run 'alsamixer -c <card>', press F4, and raise Mic.",
+                    flush=True,
+                )
+            elif rms < min_rms * 0.5:
+                print(
+                    "[MICTEST] Ambient level is very low. If speech is not detected, raise the capture "
+                    "gain or lower 'recording.min_rms' in config.json.",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[MICTEST] Microphone self-test failed: {exc}", flush=True)
 
     def _start_wake_loader_thread(self):
         if self.exiting:
@@ -814,6 +921,14 @@ class BotGUI:
             if not wake_models:
                 print("[WAKE] No wake-word model available; Enter remains available.", flush=True)
                 return
+            if not self._ensure_wake_feature_models():
+                print(
+                    "[WAKE] openWakeWord's shared feature models (melspectrogram / embedding) are "
+                    "missing, so no wake phrase can ever match. Run ./install_wake_words.sh. "
+                    "Enter remains available.",
+                    flush=True,
+                )
+                return
             try:
                 model = Model(wakeword_models=wake_models, inference_framework="onnx")
             except TypeError:
@@ -828,6 +943,53 @@ class BotGUI:
             print(f"[WAKE] Could not load wake-word models: {exc}; Enter remains available.", flush=True)
         finally:
             self.wake_model_ready.set()
+
+    def _ensure_wake_feature_models(self) -> bool:
+        """Verify openWakeWord's shared preprocessors exist, downloading if needed.
+
+        Every wake model depends on a common melspectrogram + embedding pair.
+        The repo ships wakeword.onnx, so the legacy fallback always "found a
+        model" and construction then failed on the missing feature models. That
+        error was swallowed into a single line, leaving oww_model as None and
+        the wake phrase permanently dead with no obvious cause.
+        """
+        try:
+            feature_models = getattr(openwakeword, "FEATURE_MODELS", {}) or {}
+            expected = []
+            for meta in feature_models.values():
+                path = str((meta or {}).get("model_path", "")).strip()
+                if path.endswith(".tflite"):
+                    path = path[:-7] + ".onnx"
+                if path:
+                    expected.append(path)
+            if expected and all(os.path.exists(p) for p in expected):
+                return True
+            if not expected:
+                # This openWakeWord build does not expose FEATURE_MODELS, so
+                # there is nothing to verify. Absence of evidence is not
+                # evidence of absence: proceed and let Model() report any real
+                # problem rather than disabling wake words on a guess.
+                return True
+
+            missing = [p for p in expected if not os.path.exists(p)]
+            if missing:
+                print(f"[WAKE] Missing feature models: {', '.join(missing)}", flush=True)
+            print("[WAKE] Attempting a one-time download of the openWakeWord feature models...", flush=True)
+            try:
+                from openwakeword import utils as oww_utils
+                oww_utils.download_models(model_names=[])
+            except Exception as exc:
+                print(f"[WAKE] Feature-model download failed: {exc}", flush=True)
+                return False
+
+            if expected and not all(os.path.exists(p) for p in expected):
+                return False
+            print("[WAKE] Feature models are now present.", flush=True)
+            return True
+        except Exception as exc:
+            # Never let this check itself block wake-word loading.
+            print(f"[WAKE] Feature-model check skipped: {exc}", flush=True)
+            return True
 
     def _start_main_thread(self):
         if self.exiting:
@@ -913,6 +1075,7 @@ class BotGUI:
         self.interrupted.set()
         self.thinking_sound_active.clear()
         self.recording_active.clear()
+        self.finish_recording.clear()
         with self.tts_queue_lock:
             self.tts_queue.clear()
         process = self.current_audio_process
@@ -937,6 +1100,7 @@ class BotGUI:
         self.thinking_sound_active.clear()
         self.recording_active.clear()
         self.interrupted.clear()
+        self.finish_recording.clear()
         try:
             sd.stop()
         except Exception:
@@ -970,6 +1134,10 @@ class BotGUI:
                 self.set_state(BotStates.LISTENING, "I'm listening!")
                 keyboard_mode = str(CURRENT_CONFIG.get("runtime", {}).get("keyboard_trigger_mode", "vad")).lower()
                 if trigger_source == "PTT" and keyboard_mode in {"toggle", "hold", "ptt"}:
+                    # _interrupt_current_work clears this flag, so a cancelled
+                    # cycle previously left the next PTT recording exiting its
+                    # loop immediately and returning no audio at all.
+                    self.recording_active.set()
                     audio_file = self.record_voice_ptt()
                 else:
                     # Wake word and the default one-press Enter trigger both use
@@ -1045,13 +1213,25 @@ class BotGUI:
         # Wake models load asynchronously so the GUI never blocks. Enter must
         # work immediately even while ONNX initialization is still happening.
         while self.oww_model is None and not self.exiting:
-            if self.ptt_event.wait(timeout=0.10):
+            if self.ptt_event.wait(timeout=0.25):
                 self.ptt_event.clear()
                 return "PTT"
             if self.wake_model_ready.is_set() and self.oww_model is None:
-                # Loading failed/disabled. Continue polling for Enter without
-                # blocking forever in Event.wait(), which also aids shutdown.
-                continue
+                # Loading finished but produced no model. Wake detection is
+                # impossible for this run, so wait for Enter on the event
+                # instead of spinning the CPU at high frequency forever.
+                if not self._wake_unavailable_notified:
+                    self._wake_unavailable_notified = True
+                    print(
+                        "[WAKE] No usable wake model; running in Enter-only mode. "
+                        "Run ./install_wake_words.sh to enable wake phrases.",
+                        flush=True,
+                    )
+                    self.set_state(BotStates.IDLE, "Ready - press Enter (no wake word)")
+                while not self.exiting:
+                    if self.ptt_event.wait(timeout=0.5):
+                        self.ptt_event.clear()
+                        return "PTT"
         if self.exiting:
             return "PTT"
         if self.oww_model:
@@ -1116,6 +1296,17 @@ class BotGUI:
                     # score scan below.
                     self.oww_model.predict(audio)
                     current_max = int(np.max(np.abs(audio))) if len(audio) else 0
+
+                    # Periodic level reporting turns "it can't hear me" from a
+                    # guess into an observation: a flat 0 peak here means the
+                    # capture device is wrong or muted, not that the wake model
+                    # is at fault.
+                    if CURRENT_CONFIG.get("runtime", {}).get("debug_audio", False):
+                        now_mono = time.monotonic()
+                        if now_mono - self._last_wake_level_log >= 2.0:
+                            self._last_wake_level_log = now_mono
+                            print(f"[AUDIO] wake input peak={current_max}/32767", flush=True)
+
                     if current_max <= 200:
                         continue
                     for model_name, scores in self.oww_model.prediction_buffer.items():
@@ -1143,6 +1334,8 @@ class BotGUI:
         and only then counts trailing silence.
         """
         print("[AUDIO] Recording adaptive VAD...", flush=True)
+        # A press left over from a previous cycle must not end this one instantly.
+        self.finish_recording.clear()
         samplerate = choose_input_samplerate(INPUT_DEVICE, CURRENT_CONFIG.get("input_sample_rate"))
 
         cfg = CURRENT_CONFIG.get("recording", {})
@@ -1200,6 +1393,24 @@ class BotGUI:
             chunk = indata.copy()
             level = rms_level(chunk)
             total_chunks += 1
+
+            # Manual end-of-utterance: keep the audio captured so far instead of
+            # discarding it the way an interrupt does.
+            if self.finish_recording.is_set():
+                if speech_started:
+                    buffer.append(chunk)
+                else:
+                    # Nothing was detected as speech yet, so promote the pre-roll
+                    # rather than returning an empty recording.
+                    buffer.extend(pre_roll)
+                    buffer.append(chunk)
+                    pre_roll.clear()
+                    speech_started = True
+                    speech_chunks = max(speech_chunks, min_speech_chunks)
+                silent_chunks = 0
+                stop_reason = "ended by Enter"
+                stop_event.set()
+                return
 
             if not speech_started:
                 pre_roll.append(chunk)
@@ -1276,6 +1487,10 @@ class BotGUI:
                 # audio device does.
                 hard_deadline = time.monotonic() + max_record_time + calibration_time + 5.0
                 while not stop_event.is_set() and not self.exiting and not self.interrupted.is_set():
+                    if self.finish_recording.is_set() and not stop_event.is_set():
+                        # Give the callback a moment to flush the final chunk.
+                        sd.sleep(int(chunk_duration * 1000) + 20)
+                        break
                     if time.monotonic() >= hard_deadline:
                         print("[AUDIO] Input stream stalled; abandoning this recording.", flush=True)
                         stop_reason = "input stream stalled"
@@ -1307,6 +1522,7 @@ class BotGUI:
 
     def record_voice_ptt(self, filename: str = "input.wav") -> Optional[str]:
         print("[AUDIO] Recording PTT...", flush=True)
+        self.finish_recording.clear()
         time.sleep(0.2)
         samplerate = choose_input_samplerate(INPUT_DEVICE, CURRENT_CONFIG.get("input_sample_rate"))
         buffer: List[np.ndarray] = []
@@ -1322,6 +1538,8 @@ class BotGUI:
                 # A held key or a wedged stream must not hold agent-main forever.
                 hard_deadline = time.monotonic() + max_ptt_seconds
                 while self.recording_active.is_set() and not self.exiting and not self.interrupted.is_set():
+                    if self.finish_recording.is_set():
+                        break
                     if time.monotonic() >= hard_deadline:
                         print(f"[AUDIO] PTT hit the {max_ptt_seconds:.0f}s safety limit.", flush=True)
                         self.recording_active.clear()

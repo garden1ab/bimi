@@ -158,6 +158,8 @@
     "stt_timeout_seconds": 60.0,
     "tts_timeout_seconds": 35.0,
     "piper_process_timeout_seconds": 30.0,
-    "debug_progress": false
+    "debug_progress": false,
+    "debug_audio": false,
+    "stall_timeout_seconds": 180.0
   }
 }
